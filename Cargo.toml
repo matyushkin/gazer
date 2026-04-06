@@ -14,3 +14,27 @@ nalgebra = "0.33"
 
 [dev-dependencies]
 image = "0.25"
+
+[[example]]
+name = "webcam"
+required-features = ["demo"]
+
+[features]
+demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image"]
+
+[dependencies.nokhwa]
+version = "0.10"
+features = ["input-native"]
+optional = true
+
+[dependencies.minifb]
+version = "0.28"
+optional = true
+
+[dependencies.rustface]
+version = "0.1"
+optional = true
+
+[dependencies.image]
+version = "0.25"
+optional = true
