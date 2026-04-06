@@ -1,12 +1,10 @@
-//! Real-time eye tracking from webcam with EAR-based blink detection.
+//! Real-time eye tracking from webcam.
 //!
-//! Pipeline: nokhwa (camera) → rustface (face bbox) → PFLD ONNX (68 landmarks)
-//!          → Timm & Barth (pupil center) → EAR (blink detection) → minifb (display)
+//! Pipeline: nokhwa (camera) → rustface (face bbox) → PFLD (68 landmarks)
+//!          → OCEC (eye open/closed) → Timm & Barth (pupil) → MobileGaze (gaze direction)
 //!
 //! Usage:
 //!   cargo run --release --features demo --example webcam
-//!
-//! Downloads face detection model and landmark model on first run.
 
 use minifb::{Key, Window, WindowOptions};
 use nokhwa::pixel_format::RgbFormat;
@@ -16,50 +14,44 @@ use ort::session::Session;
 use rustface::ImageData;
 use saccade::blink::{BlinkDetector, EyeState};
 use saccade::classify::{EyeEvent, IVTClassifier};
-use saccade::ear;
 use saccade::frame::GrayFrame;
 use saccade::timm::{self, TimmConfig};
 use std::time::Instant;
 
-const FACE_MODEL_PATH: &str = "seeta_fd_frontal_v1.0.bin";
-const FACE_MODEL_URL: &str = "https://github.com/atomashpolskiy/rustface/raw/master/model/seeta_fd_frontal_v1.0.bin";
-const PFLD_MODEL_PATH: &str = "pfld.onnx";
-const PFLD_MODEL_URL: &str = "https://github.com/cunjian/pytorch_face_landmark/raw/refs/heads/master/onnx/pfld.onnx";
+const FACE_MODEL: &str = "seeta_fd_frontal_v1.0.bin";
+const FACE_URL: &str = "https://github.com/atomashpolskiy/rustface/raw/master/model/seeta_fd_frontal_v1.0.bin";
+const PFLD_MODEL: &str = "pfld.onnx";
+const PFLD_URL: &str = "https://github.com/cunjian/pytorch_face_landmark/raw/refs/heads/master/onnx/pfld.onnx";
+const OCEC_MODEL: &str = "ocec_p.onnx";
+const OCEC_URL: &str = "https://github.com/PINTO0309/OCEC/releases/download/onnx/ocec_p.onnx";
+const GAZE_MODEL: &str = "mobileone_s0_gaze.onnx";
+const GAZE_URL: &str = "https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0_gaze.onnx";
 
-fn download_if_missing(path: &str, url: &str) {
+fn download(path: &str, url: &str) {
     if !std::path::Path::new(path).exists() {
         println!("Downloading {path}...");
-        let status = std::process::Command::new("curl")
-            .args(["-L", "-o", path, url])
-            .status()
-            .expect("Failed to run curl");
-        if !status.success() {
-            eprintln!("Failed to download. Please run: curl -L -o {path} {url}");
-            std::process::exit(1);
-        }
+        let ok = std::process::Command::new("curl").args(["-L", "-o", path, url]).status().map(|s| s.success()).unwrap_or(false);
+        if !ok { eprintln!("Failed: curl -L -o {path} {url}"); std::process::exit(1); }
     }
 }
 
 fn main() {
-    download_if_missing(FACE_MODEL_PATH, FACE_MODEL_URL);
-    download_if_missing(PFLD_MODEL_PATH, PFLD_MODEL_URL);
+    download(FACE_MODEL, FACE_URL);
+    download(PFLD_MODEL, PFLD_URL);
+    download(OCEC_MODEL, OCEC_URL);
+    download(GAZE_MODEL, GAZE_URL);
 
-    // Face detector
-    let mut detector = rustface::create_detector(FACE_MODEL_PATH)
-        .expect("Failed to load face model");
-    detector.set_min_face_size(80);
-    detector.set_score_thresh(2.0);
+    let mut face_det = rustface::create_detector(FACE_MODEL).expect("face model");
+    face_det.set_min_face_size(80);
+    face_det.set_score_thresh(2.0);
 
-    // PFLD landmark model (68 points, input 112×112)
-    let mut landmark_session = Session::builder()
-        .expect("Failed to create ONNX session builder")
-        .commit_from_file(PFLD_MODEL_PATH)
-        .expect("Failed to load PFLD model");
+    let mut pfld = Session::builder().unwrap().commit_from_file(PFLD_MODEL).expect("PFLD model");
+    let mut ocec = Session::builder().unwrap().commit_from_file(OCEC_MODEL).expect("OCEC model");
+    let mut gaze_net = Session::builder().unwrap().commit_from_file(GAZE_MODEL).expect("Gaze model");
 
-    // Camera
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-    let mut camera = Camera::new(CameraIndex::Index(0), format).expect("Failed to open camera");
-    camera.open_stream().expect("Failed to open stream");
+    let mut camera = Camera::new(CameraIndex::Index(0), format).expect("camera");
+    camera.open_stream().expect("stream");
 
     let cam_res = camera.resolution();
     let scale_down = (cam_res.width() / 640).max(1) as usize;
@@ -67,368 +59,296 @@ fn main() {
     let cam_h = cam_res.height() as usize / scale_down;
     println!("Camera: {}×{} → {}×{}", cam_res.width(), cam_res.height(), cam_w, cam_h);
 
-    // Window
-    let mut window = Window::new("Saccade — Eye Tracker (ESC to quit)", cam_w, cam_h, WindowOptions::default())
-        .expect("Failed to create window");
+    let mut window = Window::new("Saccade — Eye Tracker (ESC to quit)", cam_w, cam_h, WindowOptions::default()).unwrap();
     window.set_target_fps(60);
 
-    // Timm config
-    let timm_config = TimmConfig {
-        gradient_threshold: 0.2,
-        use_weight_map: true,
-        weight_blur_sigma: 2.0,
-    };
-
-    // Smoothers
-    let mut face_smooth = SmoothRect::new(0.25);
-    let mut left_pupil_smooth = SmoothPoint::new(0.4);
-    let mut right_pupil_smooth = SmoothPoint::new(0.4);
-    let mut left_ear_smooth = 0.3f64;
-    let mut right_ear_smooth = 0.3f64;
-
-    // Blink detectors — hybrid openness threshold
-    let mut left_blink = BlinkDetector::new();
-    left_blink.confidence_threshold = 0.5;
-    let mut right_blink = BlinkDetector::new();
-    right_blink.confidence_threshold = 0.5;
-
+    let timm_cfg = TimmConfig { gradient_threshold: 0.2, use_weight_map: true, weight_blur_sigma: 2.0 };
+    let mut face_sm = SmRect::new(0.25);
+    let mut lp_sm = SmPt::new(0.4);
+    let mut rp_sm = SmPt::new(0.4);
+    let mut l_open_sm = 1.0f64;
+    let mut r_open_sm = 1.0f64;
+    let mut l_blink = BlinkDetector::new(); l_blink.confidence_threshold = 0.15;
+    let mut r_blink = BlinkDetector::new(); r_blink.confidence_threshold = 0.15;
+    // Adaptive: learn baseline during first 45 frames, set threshold to 50% of it
+    let mut l_baseline_sum = 0.0f64;
+    let mut r_baseline_sum = 0.0f64;
+    let mut cal_frames = 0u32;
     let mut classifier = IVTClassifier::default_params();
-    let start_time = Instant::now();
+    let start = Instant::now();
+    let mut buf = vec![0u32; cam_w * cam_h];
+    let mut fps = FpsC::new();
+    let mut no_face = 0u32;
+    let mut gaze_yaw = 0.0f64;
+    let mut gaze_pitch = 0.0f64;
 
-    let mut frame_buf = vec![0u32; cam_w * cam_h];
-    let mut fps_counter = FpsCounter::new();
-    let mut no_face_count = 0u32;
-
-    // Pre-allocate PFLD input buffer (1×3×112×112)
-    let pfld_size = 112usize;
-
-    println!("Running... Press ESC to quit.");
+    println!("Running... ESC to quit.");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        let now_ms = start_time.elapsed().as_millis() as u64;
+        let now_ms = start.elapsed().as_millis() as u64;
 
-        // Capture
         let decoded = match camera.frame() {
-            Ok(f) => match f.decode_image::<RgbFormat>() { Ok(img) => img, Err(_) => continue },
+            Ok(f) => match f.decode_image::<RgbFormat>() { Ok(i) => i, Err(_) => continue },
             Err(_) => continue,
         };
-        let full_w = decoded.width() as usize;
-        let full_h = decoded.height() as usize;
+        let (fw, fh) = (decoded.width() as usize, decoded.height() as usize);
         let rgb_full = decoded.as_raw();
 
-        // Downscale
-        let mut rgb_data = vec![0u8; cam_w * cam_h * 3];
+        let mut rgb = vec![0u8; cam_w * cam_h * 3];
         let mut gray = vec![0u8; cam_w * cam_h];
-        for y in 0..cam_h {
-            for x in 0..cam_w {
-                let sx = x * scale_down;
-                let sy = y * scale_down;
-                if sx < full_w && sy < full_h {
-                    let si = (sy * full_w + sx) * 3;
-                    let di = (y * cam_w + x) * 3;
-                    let (r, g, b) = (rgb_full[si], rgb_full[si + 1], rgb_full[si + 2]);
-                    rgb_data[di] = r;
-                    rgb_data[di + 1] = g;
-                    rgb_data[di + 2] = b;
-                    gray[y * cam_w + x] = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
-                }
+        for y in 0..cam_h { for x in 0..cam_w {
+            let (sx, sy) = (x * scale_down, y * scale_down);
+            if sx < fw && sy < fh {
+                let si = (sy * fw + sx) * 3;
+                let (r, g, b) = (rgb_full[si], rgb_full[si+1], rgb_full[si+2]);
+                let di = (y * cam_w + x) * 3;
+                rgb[di] = r; rgb[di+1] = g; rgb[di+2] = b;
+                gray[y * cam_w + x] = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
             }
-        }
+        }}
 
-        // Detect faces
-        let image_data = ImageData::new(&gray, cam_w as u32, cam_h as u32);
-        let faces = detector.detect(&image_data);
+        let faces = face_det.detect(&ImageData::new(&gray, cam_w as u32, cam_h as u32));
+        for i in 0..cam_w*cam_h { buf[i] = ((rgb[i*3] as u32)<<16)|((rgb[i*3+1] as u32)<<8)|rgb[i*3+2] as u32; }
 
-        // RGB → display buffer
-        for i in 0..cam_w * cam_h {
-            frame_buf[i] = ((rgb_data[i*3] as u32) << 16) | ((rgb_data[i*3+1] as u32) << 8) | rgb_data[i*3+2] as u32;
-        }
+        let best = faces.iter().max_by_key(|f| { let b=f.bbox(); b.width()*b.height() });
 
-        let best_face = faces.iter().max_by_key(|f| {
-            let b = f.bbox();
-            b.width() as i32 * b.height() as i32
-        });
+        if let Some(face) = best {
+            no_face = 0;
+            let bb = face.bbox();
+            face_sm.update(bb.x().max(0) as f64, bb.y().max(0) as f64, bb.width() as f64, bb.height() as f64);
+            let (fx, fy, fw, fh) = face_sm.get();
+            draw_rect(&mut buf, cam_w, cam_h, fx, fy, fw, fh, 0xFFFF00);
 
-        if let Some(face) = best_face {
-            no_face_count = 0;
-            let bbox = face.bbox();
-            face_smooth.update(
-                bbox.x().max(0) as f64, bbox.y().max(0) as f64,
-                bbox.width() as f64, bbox.height() as f64,
-            );
-            let (sfx, sfy, sfw, sfh) = face_smooth.get();
-            draw_rect(&mut frame_buf, cam_w, cam_h, sfx, sfy, sfw, sfh, 0xFFFF00);
+            // PFLD landmarks
+            if let Some(lm) = run_pfld(&mut pfld, &gray, cam_w, cam_h, fx, fy, fw, fh) {
+                // Draw landmarks
+                for &(lx, ly) in &lm { let (px, py) = (lx as usize, ly as usize);
+                    if px < cam_w && py < cam_h { buf[py*cam_w+px] = 0x00FF00; }
+                }
 
-            // Run PFLD on the face crop
-            if let Some(landmarks) = run_pfld(&mut landmark_session, &gray, cam_w, cam_h, sfx, sfy, sfw, sfh, pfld_size) {
-                // Draw all 68 landmarks as tiny dots
-                for &(lx, ly) in &landmarks {
-                    let px = lx.round() as usize;
-                    let py = ly.round() as usize;
-                    if px < cam_w && py < cam_h {
-                        frame_buf[py * cam_w + px] = 0x00FF00;
+                // OCEC eye open/closed for each eye
+                let r_open = run_ocec(&mut ocec, &gray, cam_w, cam_h, &lm, 36, 41);
+                let l_open = run_ocec(&mut ocec, &gray, cam_w, cam_h, &lm, 42, 47);
+
+                l_open_sm = 0.4 * l_open as f64 + 0.6 * l_open_sm;
+                r_open_sm = 0.4 * r_open as f64 + 0.6 * r_open_sm;
+
+                // Adaptive calibration: learn "open" baseline
+                if cal_frames < 45 {
+                    l_baseline_sum += l_open_sm;
+                    r_baseline_sum += r_open_sm;
+                    cal_frames += 1;
+                    if cal_frames == 45 {
+                        let l_base = l_baseline_sum / 45.0;
+                        let r_base = r_baseline_sum / 45.0;
+                        l_blink.confidence_threshold = (l_base * 0.5).max(0.05);
+                        r_blink.confidence_threshold = (r_base * 0.5).max(0.05);
+                        eprintln!("\nCalibrated: L_base={l_base:.3} thresh={:.3} | R_base={r_base:.3} thresh={:.3}",
+                            l_blink.confidence_threshold, r_blink.confidence_threshold);
                     }
                 }
 
-                // Compute EAR + dark_ratio hybrid for each eye
-                let ear_pair = ear::compute_ear_from_landmarks(&landmarks);
+                let l_state = l_blink.update(l_open_sm, now_ms);
+                let r_state = r_blink.update(r_open_sm, now_ms);
 
-                // Right eye (landmarks 36-41)
-                let (right_open, right_pupil) = process_eye(
-                    &landmarks, 36, 41, ear_pair.map(|p| p.0),
-                    &gray, cam_w, cam_h, &timm_config,
-                );
-                right_ear_smooth = 0.4 * right_open + 0.6 * right_ear_smooth;
-                let right_state = right_blink.update(right_ear_smooth, now_ms);
-                if let Some((px, py)) = right_pupil {
-                    right_pupil_smooth.update(px, py);
-                    let (spx, spy) = right_pupil_smooth.get();
-                    draw_crosshair(&mut frame_buf, cam_w, cam_h, spx, spy, 0xFF0000);
-                    classifier.update(px, py, now_ms);
+                draw_filled_circle(&mut buf, cam_w, cam_h, cam_w-40, 15, 8, state_color(l_state));
+                draw_filled_circle(&mut buf, cam_w, cam_h, cam_w-20, 15, 8, state_color(r_state));
+
+                // Pupil tracking (Timm & Barth on eye ROI from landmarks)
+                if l_open_sm > 0.5 {
+                    if let Some((px, py)) = detect_pupil(&lm, 42, 47, &gray, cam_w, cam_h, &timm_cfg) {
+                        lp_sm.update(px, py);
+                        let (sx, sy) = lp_sm.get();
+                        draw_cross(&mut buf, cam_w, cam_h, sx, sy, 0x00FFFF);
+                    }
+                }
+                if r_open_sm > 0.5 {
+                    if let Some((px, py)) = detect_pupil(&lm, 36, 41, &gray, cam_w, cam_h, &timm_cfg) {
+                        rp_sm.update(px, py);
+                        let (sx, sy) = rp_sm.get();
+                        draw_cross(&mut buf, cam_w, cam_h, sx, sy, 0xFF0000);
+                        classifier.update(px, py, now_ms);
+                    }
                 }
 
-                // Left eye (landmarks 42-47)
-                let (left_open, left_pupil) = process_eye(
-                    &landmarks, 42, 47, ear_pair.map(|p| p.1),
-                    &gray, cam_w, cam_h, &timm_config,
-                );
-                left_ear_smooth = 0.4 * left_open + 0.6 * left_ear_smooth;
-                let left_state = left_blink.update(left_ear_smooth, now_ms);
-                if let Some((px, py)) = left_pupil {
-                    left_pupil_smooth.update(px, py);
-                    let (spx, spy) = left_pupil_smooth.get();
-                    draw_crosshair(&mut frame_buf, cam_w, cam_h, spx, spy, 0x00FFFF);
-                }
+                // Gaze estimation (MobileGaze on face crop)
+                if let Some((yaw, pitch)) = run_gaze(&mut gaze_net, &rgb, cam_w, cam_h, fx, fy, fw, fh) {
+                    gaze_yaw = 0.3 * yaw as f64 + 0.7 * gaze_yaw;
+                    gaze_pitch = 0.3 * pitch as f64 + 0.7 * gaze_pitch;
 
-                // Eye state indicators — experimental (PFLD doesn't track closed eyes well)
-                // Show as small dots, dimmed to indicate unreliable
-                draw_filled_circle(&mut frame_buf, cam_w, cam_h, cam_w - 40, 15, 5, eye_state_color(right_state));
-                draw_filled_circle(&mut frame_buf, cam_w, cam_h, cam_w - 20, 15, 5, eye_state_color(left_state));
+                    // Draw gaze direction arrow from face center
+                    let cx = fx + fw / 2;
+                    let cy = fy + fh / 2;
+                    let arrow_len = 60.0;
+                    let ax = cx as f64 - arrow_len * (gaze_yaw.to_radians()).sin();
+                    let ay = cy as f64 - arrow_len * (gaze_pitch.to_radians()).sin();
+                    draw_line(&mut buf, cam_w, cam_h, cx, cy, ax as usize, ay as usize, 0xFF00FF);
+                }
             }
         } else {
-            no_face_count += 1;
-            if no_face_count > 30 {
-                left_blink.reset();
-                right_blink.reset();
-                left_pupil_smooth = SmoothPoint::new(0.4);
-                right_pupil_smooth = SmoothPoint::new(0.4);
-                no_face_count = 0;
-            } else if face_smooth.initialized {
-                let (sfx, sfy, sfw, sfh) = face_smooth.get();
-                draw_rect(&mut frame_buf, cam_w, cam_h, sfx, sfy, sfw, sfh, 0x666600);
-            }
+            no_face += 1;
+            if no_face > 30 { l_blink.reset(); r_blink.reset(); lp_sm = SmPt::new(0.4); rp_sm = SmPt::new(0.4); no_face = 0; }
+            else if face_sm.init { let (fx,fy,fw,fh)=face_sm.get(); draw_rect(&mut buf,cam_w,cam_h,fx,fy,fw,fh,0x666600); }
         }
 
-        // FPS bar
-        fps_counter.tick();
-        let fps = fps_counter.fps();
-        let bar_len = (fps as usize * 3).min(cam_w);
-        let bar_color = if fps > 20.0 { 0x00FF00 } else if fps > 10.0 { 0xFFFF00 } else { 0xFF0000 };
-        for x in 0..bar_len {
-            for y in 0..4 { frame_buf[y * cam_w + x] = bar_color; }
-        }
+        fps.tick();
+        let f = fps.fps();
+        let bar = (f as usize * 3).min(cam_w);
+        let bc = if f > 15.0 { 0x00FF00 } else if f > 8.0 { 0xFFFF00 } else { 0xFF0000 };
+        for x in 0..bar { for y in 0..4 { buf[y*cam_w+x] = bc; } }
 
-        window.update_with_buffer(&frame_buf, cam_w, cam_h).unwrap();
+        window.update_with_buffer(&buf, cam_w, cam_h).unwrap();
 
-        if fps_counter.frame_count % 30 == 0 {
-            let l_state = format!("{:?}", left_blink.state());
-            let r_state = format!("{:?}", right_blink.state());
-            let blinks = left_blink.blink_count() + right_blink.blink_count();
-            let bpm = (left_blink.blinks_per_minute(now_ms, 60_000)
-                + right_blink.blinks_per_minute(now_ms, 60_000)) / 2.0;
-            let fixations = classifier.events().iter().filter(|e| matches!(e, EyeEvent::Fixation(_))).count();
-            let saccades = classifier.events().iter().filter(|e| matches!(e, EyeEvent::Saccade(_))).count();
-            print!("\rFPS:{fps:.0} | EAR L:{left_ear_smooth:.2} R:{right_ear_smooth:.2} | {l_state}/{r_state} | Blinks:{blinks} ({bpm:.0}/min) | Fix:{fixations} Sac:{saccades}    ");
+        if fps.count % 30 == 0 {
+            let ls = format!("{:?}", l_blink.state());
+            let rs = format!("{:?}", r_blink.state());
+            let bl = l_blink.blink_count() + r_blink.blink_count();
+            let bpm = (l_blink.blinks_per_minute(now_ms, 60000) + r_blink.blinks_per_minute(now_ms, 60000)) / 2.0;
+            let fix = classifier.events().iter().filter(|e| matches!(e, EyeEvent::Fixation(_))).count();
+            let sac = classifier.events().iter().filter(|e| matches!(e, EyeEvent::Saccade(_))).count();
+            print!("\rFPS:{f:.0} | Eyes:{ls}/{rs} | Blinks:{bl}({bpm:.0}/m) | Gaze:y={gaze_yaw:.1}° p={gaze_pitch:.1}° | Fix:{fix} Sac:{sac}    ");
         }
     }
     println!("\nDone.");
 }
 
-/// Process one eye: compute hybrid openness (EAR + dark_ratio) and detect pupil.
-/// Returns (openness, Option<(pupil_x, pupil_y)>).
-fn process_eye(
-    landmarks: &[(f32, f32)],
-    start_idx: usize,
-    end_idx: usize,
-    ear: Option<f32>,
-    gray: &[u8],
-    img_w: usize,
-    img_h: usize,
-    config: &TimmConfig,
-) -> (f64, Option<(f64, f64)>) {
-    // Get eye ROI from landmarks
-    let eye_points = &landmarks[start_idx..=end_idx];
-    let min_x = eye_points.iter().map(|p| p.0).fold(f32::MAX, f32::min);
-    let max_x = eye_points.iter().map(|p| p.0).fold(f32::MIN, f32::max);
-    let min_y = eye_points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
-    let max_y = eye_points.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+fn run_pfld(s: &mut Session, g: &[u8], w: usize, h: usize, fx: usize, fy: usize, fw: usize, fh: usize) -> Option<Vec<(f32,f32)>> {
+    if fx+fw>w || fy+fh>h || fw<20 || fh<20 { return None; }
+    let sz = 112;
+    let mut inp = vec![0.0f32; 3*sz*sz];
+    for y in 0..sz { for x in 0..sz {
+        let (sx, sy) = (fx + x*fw/sz, fy + y*fh/sz);
+        let v = if sx<w && sy<h { g[sy*w+sx] as f32 / 255.0 } else { 0.0 };
+        inp[y*sz+x] = v; inp[sz*sz+y*sz+x] = v; inp[2*sz*sz+y*sz+x] = v;
+    }}
+    let t = ort::value::Tensor::from_array(([1,3,sz,sz], inp.into_boxed_slice())).ok()?;
+    let out = s.run(ort::inputs![t]).ok()?;
+    let first = out.iter().next()?;
+    let (_, d) = first.1.try_extract_tensor::<f32>().ok()?;
+    if d.len() < 136 { return None; }
+    Some((0..68).map(|i| (d[i*2]*fw as f32 + fx as f32, d[i*2+1]*fh as f32 + fy as f32)).collect())
+}
 
-    let margin_x = (max_x - min_x) * 0.3;
-    let margin_y = (max_y - min_y) * 0.5;
-    let roi_x = (min_x - margin_x).max(0.0) as usize;
-    let roi_y = (min_y - margin_y).max(0.0) as usize;
-    let roi_w = ((max_x - min_x) + 2.0 * margin_x) as usize;
-    let roi_h = ((max_y - min_y) + 2.0 * margin_y) as usize;
+fn run_ocec(s: &mut Session, g: &[u8], w: usize, h: usize, lm: &[(f32,f32)], s_idx: usize, e_idx: usize) -> f32 {
+    let pts = &lm[s_idx..=e_idx];
+    let min_x = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+    let max_x = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+    let min_y = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+    let max_y = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+    let mx = (max_x - min_x) * 0.4;
+    let my = (max_y - min_y) * 0.6;
+    let rx = (min_x - mx).max(0.0) as usize;
+    let ry = (min_y - my).max(0.0) as usize;
+    let rw = ((max_x - min_x) + 2.0*mx) as usize;
+    let rh = ((max_y - min_y) + 2.0*my) as usize;
+    if rx+rw>w || ry+rh>h || rw<4 || rh<4 { return 1.0; }
 
-    if roi_x + roi_w > img_w || roi_y + roi_h > img_h || roi_w < 8 || roi_h < 6 {
-        return (0.0, None);
-    }
-
-    // Compute dark_ratio in eye ROI
-    let mut eye_data = vec![0u8; roi_w * roi_h];
-    for y in 0..roi_h {
-        let src = (roi_y + y) * img_w + roi_x;
-        eye_data[y * roi_w..(y + 1) * roi_w].copy_from_slice(&gray[src..src + roi_w]);
-    }
-
-    let n = eye_data.len() as f64;
-    let mean = eye_data.iter().map(|&p| p as f64).sum::<f64>() / n;
-    let dark_thresh = (mean * 0.6) as u8;
-    let dark_count = eye_data.iter().filter(|&&p| p < dark_thresh).count();
-    let dark_ratio = dark_count as f64 / n;
-
-    // Hybrid openness: combine EAR (if available) with dark_ratio
-    // EAR: ~0.30 open, ~0.15 blink — but PFLD may not track closed eyes well
-    // dark_ratio: ~0.08-0.12 open, ~0.02-0.04 closed
-    // Use dark_ratio as the primary signal, EAR as bonus
-    let ear_signal = ear.map(|e| e as f64).unwrap_or(0.3);
-    let openness = 0.4 * (dark_ratio / 0.10).clamp(0.0, 1.0) + 0.6 * (ear_signal / 0.30).clamp(0.0, 1.0);
-
-    // Detect pupil if eye seems open
-    let pupil = if openness > 0.4 {
-        detect_pupil_in_roi(&mut eye_data, roi_x, roi_y, roi_w, roi_h, config)
-    } else {
-        None
+    // OCEC expects [batch, 3, 24, 40] normalized RGB
+    let (oh, ow) = (24, 40);
+    let mut inp = vec![0.0f32; 3*oh*ow];
+    for y in 0..oh { for x in 0..ow {
+        let sx = rx + x*rw/ow;
+        let sy = ry + y*rh/oh;
+        let v = if sx<w && sy<h { g[sy*w+sx] as f32 / 255.0 } else { 0.0 };
+        inp[y*ow+x] = v; inp[oh*ow+y*ow+x] = v; inp[2*oh*ow+y*ow+x] = v;
+    }}
+    let t = match ort::value::Tensor::from_array(([1i64 as usize, 3, oh, ow], inp.into_boxed_slice())) {
+        Ok(t) => t, Err(_) => return 1.0,
     };
-
-    (openness, pupil)
+    let out = match s.run(ort::inputs![t]) { Ok(o) => o, Err(_) => return 1.0 };
+    let val = out.iter().next().and_then(|(_, v)| {
+        v.try_extract_tensor::<f32>().ok().map(|(_, d)| if d.is_empty() { 1.0 } else { d[0] })
+    }).unwrap_or(1.0);
+    val // prob_open: 1.0 = open, 0.0 = closed
 }
 
-/// Detect pupil center using Timm & Barth in a pre-extracted eye ROI.
-fn detect_pupil_in_roi(
-    eye_data: &mut [u8],
-    roi_x: usize, roi_y: usize,
-    roi_w: usize, roi_h: usize,
-    config: &TimmConfig,
-) -> Option<(f64, f64)> {
-    // Contrast stretch
-    let min_val = *eye_data.iter().min().unwrap_or(&0);
-    let max_val = *eye_data.iter().max().unwrap_or(&255);
-    if max_val > min_val + 10 {
-        let range = (max_val - min_val) as f32;
-        for p in eye_data.iter_mut() {
-            *p = ((*p as f32 - min_val as f32) / range * 255.0) as u8;
+fn run_gaze(s: &mut Session, rgb: &[u8], w: usize, h: usize, fx: usize, fy: usize, fw: usize, fh: usize) -> Option<(f32,f32)> {
+    if fx+fw>w || fy+fh>h || fw<20 || fh<20 { return None; }
+    // MobileGaze: [1, 3, 448, 448] RGB normalized with ImageNet stats
+    let sz = 448;
+    let mean = [0.485f32, 0.456, 0.406];
+    let std = [0.229f32, 0.224, 0.225];
+    let mut inp = vec![0.0f32; 3*sz*sz];
+    for y in 0..sz { for x in 0..sz {
+        let sx = fx + x*fw/sz;
+        let sy = fy + y*fh/sz;
+        if sx < w && sy < h {
+            let si = (sy*w+sx)*3;
+            for c in 0..3 {
+                inp[c*sz*sz+y*sz+x] = (rgb[si+c] as f32 / 255.0 - mean[c]) / std[c];
+            }
+        }
+    }}
+    let t = ort::value::Tensor::from_array(([1,3,sz,sz], inp.into_boxed_slice())).ok()?;
+    let out = s.run(ort::inputs![t]).ok()?;
+
+    // Output: yaw [1,90] and pitch [1,90] — bin classification
+    // Convert to angle: softmax → weighted sum → map to [-180, 180] range
+    let mut yaw_bins = [0.0f32; 90];
+    let mut pitch_bins = [0.0f32; 90];
+
+    let mut iter = out.iter();
+    if let Some((_, yaw_val)) = iter.next() {
+        if let Ok((_, d)) = yaw_val.try_extract_tensor::<f32>() {
+            for i in 0..90.min(d.len()) { yaw_bins[i] = d[i]; }
+        }
+    }
+    if let Some((_, pitch_val)) = iter.next() {
+        if let Ok((_, d)) = pitch_val.try_extract_tensor::<f32>() {
+            for i in 0..90.min(d.len()) { pitch_bins[i] = d[i]; }
         }
     }
 
-    let frame = GrayFrame::new(roi_w as u32, roi_h as u32, eye_data);
-    let result = timm::detect_center(&frame, config);
-    Some((roi_x as f64 + result.x, roi_y as f64 + result.y))
+    let yaw = bins_to_angle(&yaw_bins);
+    let pitch = bins_to_angle(&pitch_bins);
+    Some((yaw, pitch))
 }
 
-/// Run PFLD landmark model on a face crop. Returns 68 landmarks in original image coordinates.
-fn run_pfld(
-    session: &mut Session,
-    gray: &[u8], img_w: usize, img_h: usize,
-    fx: usize, fy: usize, fw: usize, fh: usize,
-    pfld_size: usize,
-) -> Option<Vec<(f32, f32)>> {
-    if fx + fw > img_w || fy + fh > img_h || fw < 20 || fh < 20 {
-        return None;
-    }
-
-    // Prepare 112×112 RGB input from face crop (grayscale → 3-channel)
-    let mut input = vec![0.0f32; 3 * pfld_size * pfld_size];
-    for y in 0..pfld_size {
-        for x in 0..pfld_size {
-            let src_x = fx + x * fw / pfld_size;
-            let src_y = fy + y * fh / pfld_size;
-            let val = if src_x < img_w && src_y < img_h {
-                gray[src_y * img_w + src_x] as f32 / 255.0
-            } else {
-                0.0
-            };
-            // NCHW format: [batch, channel, height, width]
-            input[0 * pfld_size * pfld_size + y * pfld_size + x] = val; // R
-            input[1 * pfld_size * pfld_size + y * pfld_size + x] = val; // G
-            input[2 * pfld_size * pfld_size + y * pfld_size + x] = val; // B
-        }
-    }
-
-    let input_tensor = ort::value::Tensor::from_array(([1usize, 3, pfld_size, pfld_size], input.into_boxed_slice())).ok()?;
-    let outputs = session.run(ort::inputs![input_tensor]).ok()?;
-
-    // Output: (1, 136) — 68 landmarks × 2 (x, y) normalized to [0, 1]
-    let output_val = outputs.iter().next()?.1;
-    let (_, data) = output_val.try_extract_tensor::<f32>().ok()?;
-
-    if data.len() < 136 {
-        return None;
-    }
-
-    let landmarks: Vec<(f32, f32)> = (0..68)
-        .map(|i| {
-            let lx = data[i * 2] * fw as f32 + fx as f32;
-            let ly = data[i * 2 + 1] * fh as f32 + fy as f32;
-            (lx, ly)
-        })
-        .collect();
-
-    Some(landmarks)
+fn bins_to_angle(bins: &[f32; 90]) -> f32 {
+    // Softmax
+    let max_val = bins.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = bins.iter().map(|&b| (b - max_val).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+    // Weighted sum: each bin = 4 degrees, range [-180, 176]
+    let angle: f32 = probs.iter().enumerate().map(|(i, &p)| p * (i as f32 * 4.0 - 180.0)).sum();
+    angle
 }
 
-
-// --- UI helpers ---
-
-struct SmoothRect { x: f64, y: f64, w: f64, h: f64, alpha: f64, initialized: bool }
-impl SmoothRect {
-    fn new(alpha: f64) -> Self { Self { x: 0.0, y: 0.0, w: 0.0, h: 0.0, alpha, initialized: false } }
-    fn update(&mut self, x: f64, y: f64, w: f64, h: f64) {
-        if !self.initialized { self.x = x; self.y = y; self.w = w; self.h = h; self.initialized = true; }
-        else { let a = self.alpha; self.x = a*x+(1.0-a)*self.x; self.y = a*y+(1.0-a)*self.y; self.w = a*w+(1.0-a)*self.w; self.h = a*h+(1.0-a)*self.h; }
-    }
-    fn get(&self) -> (usize, usize, usize, usize) { (self.x.round() as usize, self.y.round() as usize, self.w.round().max(1.0) as usize, self.h.round().max(1.0) as usize) }
+fn detect_pupil(lm: &[(f32,f32)], si: usize, ei: usize, g: &[u8], w: usize, h: usize, cfg: &TimmConfig) -> Option<(f64,f64)> {
+    let pts = &lm[si..=ei];
+    let (mnx,mxx) = (pts.iter().map(|p|p.0).fold(f32::MAX,f32::min), pts.iter().map(|p|p.0).fold(f32::MIN,f32::max));
+    let (mny,mxy) = (pts.iter().map(|p|p.1).fold(f32::MAX,f32::min), pts.iter().map(|p|p.1).fold(f32::MIN,f32::max));
+    let (mx, my) = ((mxx-mnx)*0.3, (mxy-mny)*0.5);
+    let (rx,ry) = ((mnx-mx).max(0.0) as usize, (mny-my).max(0.0) as usize);
+    let (rw,rh) = (((mxx-mnx)+2.0*mx) as usize, ((mxy-mny)+2.0*my) as usize);
+    if rx+rw>w || ry+rh>h || rw<8 || rh<6 { return None; }
+    let mut d = vec![0u8; rw*rh];
+    for y in 0..rh { d[y*rw..(y+1)*rw].copy_from_slice(&g[(ry+y)*w+rx..(ry+y)*w+rx+rw]); }
+    let (mn,mx) = (*d.iter().min()?, *d.iter().max()?);
+    if mx > mn+10 { let r=(mx-mn) as f32; for p in &mut d { *p=((*p as f32-mn as f32)/r*255.0) as u8; } }
+    let f = GrayFrame::new(rw as u32, rh as u32, &d);
+    let res = timm::detect_center(&f, cfg);
+    Some((rx as f64+res.x, ry as f64+res.y))
 }
 
-struct SmoothPoint { x: f64, y: f64, alpha: f64, initialized: bool }
-impl SmoothPoint {
-    fn new(alpha: f64) -> Self { Self { x: 0.0, y: 0.0, alpha, initialized: false } }
-    fn update(&mut self, x: f64, y: f64) {
-        if !self.initialized { self.x = x; self.y = y; self.initialized = true; }
-        else { let a = self.alpha; self.x = a*x+(1.0-a)*self.x; self.y = a*y+(1.0-a)*self.y; }
-    }
-    fn get(&self) -> (usize, usize) { (self.x.round() as usize, self.y.round() as usize) }
+// --- Drawing ---
+struct SmRect { x:f64,y:f64,w:f64,h:f64,a:f64,init:bool }
+impl SmRect {
+    fn new(a:f64)->Self{Self{x:0.0,y:0.0,w:0.0,h:0.0,a,init:false}}
+    fn update(&mut self,x:f64,y:f64,w:f64,h:f64){if!self.init{self.x=x;self.y=y;self.w=w;self.h=h;self.init=true;}else{let a=self.a;self.x=a*x+(1.0-a)*self.x;self.y=a*y+(1.0-a)*self.y;self.w=a*w+(1.0-a)*self.w;self.h=a*h+(1.0-a)*self.h;}}
+    fn get(&self)->(usize,usize,usize,usize){(self.x.round() as usize,self.y.round() as usize,self.w.round().max(1.0) as usize,self.h.round().max(1.0) as usize)}
 }
-
-fn eye_state_color(state: EyeState) -> u32 {
-    match state { EyeState::Open => 0x00FF00, EyeState::Blinking => 0xFFFF00, EyeState::Closed => 0xFF0000 }
+struct SmPt{x:f64,y:f64,a:f64,init:bool}
+impl SmPt{
+    fn new(a:f64)->Self{Self{x:0.0,y:0.0,a,init:false}}
+    fn update(&mut self,x:f64,y:f64){if!self.init{self.x=x;self.y=y;self.init=true;}else{let a=self.a;self.x=a*x+(1.0-a)*self.x;self.y=a*y+(1.0-a)*self.y;}}
+    fn get(&self)->(usize,usize){(self.x.round() as usize,self.y.round() as usize)}
 }
-
-fn draw_filled_circle(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, r: usize, color: u32) {
-    for dy in 0..=r { for dx in 0..=r { if dx*dx+dy*dy <= r*r {
-        for &(sx,sy) in &[(cx+dx,cy+dy),(cx.wrapping_sub(dx),cy+dy),(cx+dx,cy.wrapping_sub(dy)),(cx.wrapping_sub(dx),cy.wrapping_sub(dy))] {
-            if sx < w && sy < h { buf[sy*w+sx] = color; }
-        }
-    }}}
-}
-
-fn draw_rect(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, rw: usize, rh: usize, color: u32) {
-    for dx in 0..rw { let px = x+dx; if px < w { if y < h { buf[y*w+px]=color; } let by=y+rh.saturating_sub(1); if by < h { buf[by*w+px]=color; } } }
-    for dy in 0..rh { let py = y+dy; if py < h { if x < w { buf[py*w+x]=color; } let bx=x+rw.saturating_sub(1); if bx < w { buf[py*w+bx]=color; } } }
-}
-
-fn draw_crosshair(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, color: u32) {
-    for d in -6i32..=6 {
-        let x = cx as i32+d; if x >= 0 && (x as usize) < w && cy < h { buf[cy*w+x as usize]=color; }
-        let y = cy as i32+d; if y >= 0 && (y as usize) < h && cx < w { buf[y as usize*w+cx]=color; }
-    }
-    for i in 0..48 { let t=2.0*std::f64::consts::PI*i as f64/48.0; let x=(cx as f64+8.0*t.cos()).round() as i32; let y=(cy as f64+8.0*t.sin()).round() as i32;
-        if x >= 0 && (x as usize)<w && y>=0 && (y as usize)<h { buf[y as usize*w+x as usize]=color; } }
-}
-
-struct FpsCounter { last_time: Instant, frame_count: u64, fps: f64 }
-impl FpsCounter {
-    fn new() -> Self { Self { last_time: Instant::now(), frame_count: 0, fps: 0.0 } }
-    fn tick(&mut self) { self.frame_count += 1; let e = self.last_time.elapsed().as_secs_f64(); if e >= 1.0 { self.fps = self.frame_count as f64/e; self.frame_count=0; self.last_time=Instant::now(); } }
-    fn fps(&self) -> f64 { self.fps }
-}
+fn state_color(s:EyeState)->u32{match s{EyeState::Open=>0x00FF00,EyeState::Blinking=>0xFFFF00,EyeState::Closed=>0xFF0000}}
+fn draw_filled_circle(b:&mut[u32],w:usize,h:usize,cx:usize,cy:usize,r:usize,c:u32){for dy in 0..=r{for dx in 0..=r{if dx*dx+dy*dy<=r*r{for&(sx,sy)in&[(cx+dx,cy+dy),(cx.wrapping_sub(dx),cy+dy),(cx+dx,cy.wrapping_sub(dy)),(cx.wrapping_sub(dx),cy.wrapping_sub(dy))]{if sx<w&&sy<h{b[sy*w+sx]=c;}}}}}}
+fn draw_rect(b:&mut[u32],w:usize,h:usize,x:usize,y:usize,rw:usize,rh:usize,c:u32){for dx in 0..rw{let px=x+dx;if px<w{if y<h{b[y*w+px]=c;}let by=y+rh.saturating_sub(1);if by<h{b[by*w+px]=c;}}}for dy in 0..rh{let py=y+dy;if py<h{if x<w{b[py*w+x]=c;}let bx=x+rw.saturating_sub(1);if bx<w{b[py*w+bx]=c;}}}}
+fn draw_cross(b:&mut[u32],w:usize,h:usize,cx:usize,cy:usize,c:u32){for d in -6i32..=6{let x=cx as i32+d;if x>=0&&(x as usize)<w&&cy<h{b[cy*w+x as usize]=c;}let y=cy as i32+d;if y>=0&&(y as usize)<h&&cx<w{b[y as usize*w+cx]=c;}}for i in 0..48{let t=2.0*std::f64::consts::PI*i as f64/48.0;let x=(cx as f64+8.0*t.cos()).round() as i32;let y=(cy as f64+8.0*t.sin()).round() as i32;if x>=0&&(x as usize)<w&&y>=0&&(y as usize)<h{b[y as usize*w+x as usize]=c;}}}
+fn draw_line(b:&mut[u32],w:usize,h:usize,x0:usize,y0:usize,x1:usize,y1:usize,c:u32){let steps=((x1 as i32-x0 as i32).abs().max((y1 as i32-y0 as i32).abs())).max(1) as usize;for i in 0..=steps{let x=x0 as f64+(x1 as f64-x0 as f64)*i as f64/steps as f64;let y=y0 as f64+(y1 as f64-y0 as f64)*i as f64/steps as f64;let(px,py)=(x.round() as usize,y.round() as usize);if px<w&&py<h{b[py*w+px]=c;for&d in&[1usize,w]{if py*w+px+d<w*h{b[py*w+px+d]=c;}}}}}
+struct FpsC{t:Instant,count:u64,fps:f64}
+impl FpsC{fn new()->Self{Self{t:Instant::now(),count:0,fps:0.0}}fn tick(&mut self){self.count+=1;let e=self.t.elapsed().as_secs_f64();if e>=1.0{self.fps=self.count as f64/e;self.count=0;self.t=Instant::now();}}fn fps(&self)->f64{self.fps}}
