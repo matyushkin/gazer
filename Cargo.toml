@@ -24,7 +24,7 @@ name = "diag"
 required-features = ["demo"]
 
 [features]
-demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image", "dep:ort"]
+demo = ["dep:nokhwa", "dep:minifb", "dep:rustface", "dep:image", "dep:tract-onnx"]
 
 [dependencies.nokhwa]
 version = "0.10"
@@ -43,6 +43,6 @@ optional = true
 version = "0.25"
 optional = true
 
-[dependencies.ort]
-version = "2.0.0-rc.12"
+[dependencies.tract-onnx]
+version = "0.21"
 optional = true
