@@ -11,6 +11,8 @@ use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 use rustface::ImageData;
+use saccade::blink::{BlinkDetector, EyeState};
+use saccade::classify::{EyeEvent, IVTClassifier};
 use saccade::frame::GrayFrame;
 use saccade::timm::{self, TimmConfig};
 use std::time::Instant;
@@ -145,9 +147,16 @@ fn main() {
     let mut left_pupil_smooth = SmoothPoint::new(0.4); // less lag
     let mut right_pupil_smooth = SmoothPoint::new(0.4);
 
+    // Blink detectors and event classifier
+    let mut left_blink = BlinkDetector::new();
+    let mut right_blink = BlinkDetector::new();
+    let mut classifier = IVTClassifier::default_params();
+    let start_time = Instant::now();
+
     let mut frame_buf = vec![0u32; cam_w * cam_h];
     let mut fps_counter = FpsCounter::new();
     let mut no_face_count = 0u32;
+    let mut face_present = false;
 
     println!("Running... Press ESC to quit.");
 
@@ -205,8 +214,11 @@ fn main() {
             b.width() as i32 * b.height() as i32
         });
 
+        let now_ms = start_time.elapsed().as_millis() as u64;
+
         if let Some(face) = best_face {
             no_face_count = 0;
+            face_present = true;
             let bbox = face.bbox();
             let fx = bbox.x().max(0) as f64;
             let fy = bbox.y().max(0) as f64;
@@ -233,30 +245,53 @@ fn main() {
             let (lx, ly, lw, lh) = left_eye_smooth.get();
             let (rx, ry, rw, rh) = right_eye_smooth.get();
 
-            // Track left eye with Timm & Barth
-            if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, lx, ly, lw, lh, &timm_config) {
+            // Track left eye
+            let left_conf = if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, lx, ly, lw, lh, &timm_config) {
                 draw_rect(&mut frame_buf, cam_w, cam_h, lx, ly, lw, lh, 0x00FF00);
                 if conf > 0.05 {
                     left_pupil_smooth.update(cx, cy);
                     let (px, py) = left_pupil_smooth.get();
                     draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0xFF0000);
-                }
-            }
 
-            // Track right eye with Timm & Barth
-            if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, rx, ry, rw, rh, &timm_config) {
+                    // Feed classifier with average pupil position
+                    classifier.update(cx, cy, now_ms);
+                }
+                conf
+            } else {
+                0.0
+            };
+
+            // Track right eye
+            let right_conf = if let Some((cx, cy, conf)) = detect_eye(&gray, cam_w, cam_h, rx, ry, rw, rh, &timm_config) {
                 draw_rect(&mut frame_buf, cam_w, cam_h, rx, ry, rw, rh, 0x00FF00);
                 if conf > 0.05 {
                     right_pupil_smooth.update(cx, cy);
                     let (px, py) = right_pupil_smooth.get();
                     draw_crosshair(&mut frame_buf, cam_w, cam_h, px, py, 0x00FFFF);
                 }
-            }
+                conf
+            } else {
+                0.0
+            };
+
+            // Update blink detectors
+            let left_eye_state = left_blink.update(left_conf, now_ms);
+            let right_eye_state = right_blink.update(right_conf, now_ms);
+
+            // Draw eye state indicators (colored dots in top-right)
+            let state_y = 15;
+            let left_color = eye_state_color(left_eye_state);
+            let right_color = eye_state_color(right_eye_state);
+            draw_filled_circle(&mut frame_buf, cam_w, cam_h, cam_w - 40, state_y, 8, left_color);
+            draw_filled_circle(&mut frame_buf, cam_w, cam_h, cam_w - 20, state_y, 8, right_color);
         } else {
             no_face_count += 1;
+            face_present = false;
             if no_face_count > 30 {
                 left_pupil_smooth = SmoothPoint::new(0.4);
                 right_pupil_smooth = SmoothPoint::new(0.4);
+                left_blink.reset();
+                right_blink.reset();
                 no_face_count = 0;
             } else if face_smooth.initialized {
                 // Use last known face position for a few frames
@@ -280,7 +315,16 @@ fn main() {
         window.update_with_buffer(&frame_buf, cam_w, cam_h).unwrap();
 
         if fps_counter.frame_count % 30 == 0 {
-            print!("\rFPS: {fps:.1} | Frame: {frame_ms}ms | Faces: {}    ", faces.len());
+            let l_state = if face_present { format!("{:?}", left_blink.state()) } else { "NoFace".into() };
+            let r_state = if face_present { format!("{:?}", right_blink.state()) } else { "NoFace".into() };
+            let blinks = left_blink.blink_count() + right_blink.blink_count();
+            let bpm = (left_blink.blinks_per_minute(now_ms, 60_000)
+                + right_blink.blinks_per_minute(now_ms, 60_000)) / 2.0;
+            let fixations = classifier.events().iter()
+                .filter(|e| matches!(e, EyeEvent::Fixation(_))).count();
+            let saccades = classifier.events().iter()
+                .filter(|e| matches!(e, EyeEvent::Saccade(_))).count();
+            print!("\rFPS:{fps:.0} | L:{l_state} R:{r_state} | Blinks:{blinks} ({bpm:.0}/min) | Fix:{fixations} Sac:{saccades}    ");
         }
     }
 
@@ -345,6 +389,31 @@ fn draw_rect(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, rw: usize,
             if x < w { buf[py * w + x] = color; }
             let bx = x + rw.saturating_sub(1);
             if bx < w { buf[py * w + bx] = color; }
+        }
+    }
+}
+
+fn eye_state_color(state: EyeState) -> u32 {
+    match state {
+        EyeState::Open => 0x00FF00,    // green
+        EyeState::Blinking => 0xFFFF00, // yellow
+        EyeState::Closed => 0xFF0000,   // red
+    }
+}
+
+fn draw_filled_circle(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, r: usize, color: u32) {
+    for dy in 0..=r {
+        for dx in 0..=r {
+            if dx * dx + dy * dy <= r * r {
+                for &(sx, sy) in &[
+                    (cx + dx, cy + dy), (cx.wrapping_sub(dx), cy + dy),
+                    (cx + dx, cy.wrapping_sub(dy)), (cx.wrapping_sub(dx), cy.wrapping_sub(dy)),
+                ] {
+                    if sx < w && sy < h {
+                        buf[sy * w + sx] = color;
+                    }
+                }
+            }
         }
     }
 }
