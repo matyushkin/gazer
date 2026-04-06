@@ -22,8 +22,8 @@ const FACE_MODEL: &str = "seeta_fd_frontal_v1.0.bin";
 const FACE_URL: &str = "https://github.com/atomashpolskiy/rustface/raw/master/model/seeta_fd_frontal_v1.0.bin";
 const PFLD_MODEL: &str = "pfld.onnx";
 const PFLD_URL: &str = "https://github.com/cunjian/pytorch_face_landmark/raw/refs/heads/master/onnx/pfld.onnx";
-const OCEC_MODEL: &str = "ocec_p.onnx";
-const OCEC_URL: &str = "https://github.com/PINTO0309/OCEC/releases/download/onnx/ocec_p.onnx";
+const OCEC_MODEL: &str = "ocec_m.onnx";
+const OCEC_URL: &str = "https://github.com/PINTO0309/OCEC/releases/download/onnx/ocec_m.onnx";
 const GAZE_MODEL: &str = "mobileone_s0_gaze.onnx";
 const GAZE_URL: &str = "https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0_gaze.onnx";
 
@@ -70,6 +70,8 @@ fn main() {
     let mut r_open_sm = 1.0f64;
     let mut l_blink = BlinkDetector::new(); l_blink.confidence_threshold = 0.15;
     let mut r_blink = BlinkDetector::new(); r_blink.confidence_threshold = 0.15;
+    let mut l_ocec_roi = OcecEyeState::new();
+    let mut r_ocec_roi = OcecEyeState::new();
     // Adaptive: learn baseline during first 45 frames, set threshold to 50% of it
     let mut l_baseline_sum = 0.0f64;
     let mut r_baseline_sum = 0.0f64;
@@ -126,14 +128,15 @@ fn main() {
                     if px < cam_w && py < cam_h { buf[py*cam_w+px] = 0x00FF00; }
                 }
 
-                // OCEC eye open/closed for each eye
-                let r_open = run_ocec(&mut ocec, &gray, cam_w, cam_h, &lm, 36, 41);
-                let l_open = run_ocec(&mut ocec, &gray, cam_w, cam_h, &lm, 42, 47);
+                // OCEC eye open/closed from tight landmark-based eye ROI
+                let r_open = run_ocec_lm(&mut ocec, &gray, cam_w, cam_h, &lm, 36, 41, &mut r_ocec_roi);
+                let l_open = run_ocec_lm(&mut ocec, &gray, cam_w, cam_h, &lm, 42, 47, &mut l_ocec_roi);
 
-                l_open_sm = 0.4 * l_open as f64 + 0.6 * l_open_sm;
-                r_open_sm = 0.4 * r_open as f64 + 0.6 * r_open_sm;
+                // Moderate smoothing — filter single-frame jitter but respond to real closures
+                l_open_sm = 0.5 * l_open as f64 + 0.5 * l_open_sm;
+                r_open_sm = 0.5 * r_open as f64 + 0.5 * r_open_sm;
 
-                // Adaptive calibration: learn "open" baseline
+                // Adaptive calibration: only count frames where face is actually detected
                 if cal_frames < 45 {
                     l_baseline_sum += l_open_sm;
                     r_baseline_sum += r_open_sm;
@@ -141,15 +144,22 @@ fn main() {
                     if cal_frames == 45 {
                         let l_base = l_baseline_sum / 45.0;
                         let r_base = r_baseline_sum / 45.0;
-                        l_blink.confidence_threshold = (l_base * 0.5).max(0.05);
-                        r_blink.confidence_threshold = (r_base * 0.5).max(0.05);
+                        // Threshold = 40% of baseline — below this = eye closed
+                        l_blink.confidence_threshold = (l_base * 0.4).max(0.03);
+                        r_blink.confidence_threshold = (r_base * 0.4).max(0.03);
                         eprintln!("\nCalibrated: L_base={l_base:.3} thresh={:.3} | R_base={r_base:.3} thresh={:.3}",
                             l_blink.confidence_threshold, r_blink.confidence_threshold);
                     }
                 }
 
+                // Feed smoothed OCEC value to blink detector
                 let l_state = l_blink.update(l_open_sm, now_ms);
                 let r_state = r_blink.update(r_open_sm, now_ms);
+
+                if fps.count % 5 == 0 {
+                    eprint!("\r  [OCEC] L={l_open:.3} R={r_open:.3} | thresh L={:.3} R={:.3}     ",
+                        l_blink.confidence_threshold, r_blink.confidence_threshold);
+                }
 
                 draw_filled_circle(&mut buf, cam_w, cam_h, cam_w-40, 15, 8, state_color(l_state));
                 draw_filled_circle(&mut buf, cam_w, cam_h, cam_w-20, 15, 8, state_color(r_state));
@@ -229,21 +239,37 @@ fn run_pfld(s: &mut Session, g: &[u8], w: usize, h: usize, fx: usize, fy: usize,
     Some((0..68).map(|i| (d[i*2]*fw as f32 + fx as f32, d[i*2+1]*fh as f32 + fy as f32)).collect())
 }
 
-fn run_ocec(s: &mut Session, g: &[u8], w: usize, h: usize, lm: &[(f32,f32)], s_idx: usize, e_idx: usize) -> f32 {
-    let pts = &lm[s_idx..=e_idx];
+/// Smoothed OCEC ROI state per eye — holds last good ROI to prevent jitter
+struct OcecEyeState {
+    rx: f64, ry: f64, rw: f64, rh: f64,
+    init: bool,
+}
+impl OcecEyeState {
+    fn new() -> Self { Self { rx: 0.0, ry: 0.0, rw: 0.0, rh: 0.0, init: false } }
+    fn update(&mut self, rx: f64, ry: f64, rw: f64, rh: f64) {
+        if !self.init { self.rx=rx; self.ry=ry; self.rw=rw; self.rh=rh; self.init=true; }
+        else { let a=0.3; self.rx=a*rx+(1.0-a)*self.rx; self.ry=a*ry+(1.0-a)*self.ry; self.rw=a*rw+(1.0-a)*self.rw; self.rh=a*rh+(1.0-a)*self.rh; }
+    }
+    fn get(&self) -> (usize,usize,usize,usize) { (self.rx.round() as usize, self.ry.round() as usize, self.rw.round().max(4.0) as usize, self.rh.round().max(4.0) as usize) }
+}
+
+fn run_ocec_lm(s: &mut Session, g: &[u8], w: usize, h: usize, lm: &[(f32,f32)], si: usize, ei: usize, roi_state: &mut OcecEyeState) -> f32 {
+    let pts = &lm[si..=ei];
     let min_x = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min);
     let max_x = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max);
     let min_y = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min);
     let max_y = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max);
-    let mx = (max_x - min_x) * 0.4;
-    let my = (max_y - min_y) * 0.6;
-    let rx = (min_x - mx).max(0.0) as usize;
-    let ry = (min_y - my).max(0.0) as usize;
-    let rw = ((max_x - min_x) + 2.0*mx) as usize;
-    let rh = ((max_y - min_y) + 2.0*my) as usize;
-    if rx+rw>w || ry+rh>h || rw<4 || rh<4 { return 1.0; }
+    let mx = (max_x - min_x) * 0.15;
+    let my = (max_y - min_y) * 0.3;
+    let new_rx = (min_x - mx).max(0.0) as f64;
+    let new_ry = (min_y - my).max(0.0) as f64;
+    let new_rw = ((max_x - min_x) + 2.0*mx).max(4.0) as f64;
+    let new_rh = ((max_y - min_y) + 2.0*my).max(4.0) as f64;
 
-    // OCEC expects [batch, 3, 24, 40] normalized RGB
+    roi_state.update(new_rx, new_ry, new_rw, new_rh);
+    let (rx, ry, rw, rh) = roi_state.get();
+    if rx+rw>w || ry+rh>h { return 1.0; }
+
     let (oh, ow) = (24, 40);
     let mut inp = vec![0.0f32; 3*oh*ow];
     for y in 0..oh { for x in 0..ow {
@@ -252,14 +278,13 @@ fn run_ocec(s: &mut Session, g: &[u8], w: usize, h: usize, lm: &[(f32,f32)], s_i
         let v = if sx<w && sy<h { g[sy*w+sx] as f32 / 255.0 } else { 0.0 };
         inp[y*ow+x] = v; inp[oh*ow+y*ow+x] = v; inp[2*oh*ow+y*ow+x] = v;
     }}
-    let t = match ort::value::Tensor::from_array(([1i64 as usize, 3, oh, ow], inp.into_boxed_slice())) {
+    let t = match ort::value::Tensor::from_array(([1usize, 3, oh, ow], inp.into_boxed_slice())) {
         Ok(t) => t, Err(_) => return 1.0,
     };
     let out = match s.run(ort::inputs![t]) { Ok(o) => o, Err(_) => return 1.0 };
-    let val = out.iter().next().and_then(|(_, v)| {
+    out.iter().next().and_then(|(_, v)| {
         v.try_extract_tensor::<f32>().ok().map(|(_, d)| if d.is_empty() { 1.0 } else { d[0] })
-    }).unwrap_or(1.0);
-    val // prob_open: 1.0 = open, 0.0 = closed
+    }).unwrap_or(1.0)
 }
 
 fn run_gaze(s: &mut Session, rgb: &[u8], w: usize, h: usize, fx: usize, fy: usize, fw: usize, fh: usize) -> Option<(f32,f32)> {
