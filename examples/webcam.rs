@@ -10,14 +10,14 @@ use minifb::{Key, Window, WindowOptions};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
-use rustface::{Detector, ImageData};
+use rustface::ImageData;
 use saccade::frame::GrayFrame;
 use saccade::pure::PureConfig;
 use saccade::tracker::{Tracker, TrackerConfig, TrackingMode};
 use std::time::Instant;
 
 const MODEL_PATH: &str = "seeta_fd_frontal_v1.0.bin";
-const MODEL_URL: &str = "https://github.com/nicklhy/DenseNet/raw/refs/heads/master/data/seeta_fd_frontal_v1.0.bin";
+const MODEL_URL: &str = "https://github.com/atomashpolskiy/rustface/raw/master/model/seeta_fd_frontal_v1.0.bin";
 
 fn main() {
     // Ensure face detection model exists
@@ -47,9 +47,14 @@ fn main() {
         .expect("Failed to open camera");
     camera.open_stream().expect("Failed to open camera stream");
 
-    let cam_w = camera.resolution().width() as usize;
-    let cam_h = camera.resolution().height() as usize;
-    println!("Camera: {cam_w}×{cam_h}");
+    let cam_res = camera.resolution();
+    println!("Camera native: {}×{}", cam_res.width(), cam_res.height());
+
+    // We'll downscale to ~640px wide for processing speed
+    let scale_down = (cam_res.width() / 640).max(1) as usize;
+    let cam_w = cam_res.width() as usize / scale_down;
+    let cam_h = cam_res.height() as usize / scale_down;
+    println!("Processing at: {cam_w}×{cam_h} (scale 1/{scale_down})");
 
     // Initialize display window
     let win_w = cam_w;
@@ -84,30 +89,51 @@ fn main() {
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let frame_start = Instant::now();
 
-        // Capture frame
-        let rgb_frame = match camera.frame() {
-            Ok(f) => f,
+        // Capture frame — decode to RGB
+        let decoded = match camera.frame() {
+            Ok(f) => f.decode_image::<RgbFormat>(),
             Err(e) => {
                 eprintln!("Frame error: {e}");
                 continue;
             }
         };
+        let rgb_image = match decoded {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("Decode error: {e}");
+                continue;
+            }
+        };
+        let full_w = rgb_image.width() as usize;
+        let full_h = rgb_image.height() as usize;
+        let rgb_full = rgb_image.as_raw();
 
-        let rgb_data = rgb_frame.buffer();
-        let (fw, fh) = (rgb_frame.resolution().width() as usize, rgb_frame.resolution().height() as usize);
-
-        // Convert to grayscale for detection
-        let gray: Vec<u8> = rgb_data
-            .chunks_exact(3)
-            .map(|rgb| (0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32) as u8)
-            .collect();
+        // Downscale RGB and grayscale
+        let mut rgb_data = vec![0u8; cam_w * cam_h * 3];
+        let mut gray = vec![0u8; cam_w * cam_h];
+        for y in 0..cam_h {
+            for x in 0..cam_w {
+                let sx = x * scale_down;
+                let sy = y * scale_down;
+                if sx < full_w && sy < full_h {
+                    let si = (sy * full_w + sx) * 3;
+                    let di = (y * cam_w + x) * 3;
+                    let (r, g, b) = (rgb_full[si], rgb_full[si + 1], rgb_full[si + 2]);
+                    rgb_data[di] = r;
+                    rgb_data[di + 1] = g;
+                    rgb_data[di + 2] = b;
+                    gray[y * cam_w + x] =
+                        (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
+                }
+            }
+        }
 
         // Detect faces
-        let image_data = ImageData::new(&gray, fw as u32, fh as u32);
+        let image_data = ImageData::new(&gray, cam_w as u32, cam_h as u32);
         let faces = detector.detect(&image_data);
 
-        // Convert RGB to display buffer (0xAARRGGBB)
-        for i in 0..fw * fh {
+        // Convert RGB to display buffer (0x00RRGGBB)
+        for i in 0..cam_w * cam_h {
             let r = rgb_data[i * 3] as u32;
             let g = rgb_data[i * 3 + 1] as u32;
             let b = rgb_data[i * 3 + 2] as u32;
