@@ -1,0 +1,12 @@
+[package]
+name = "gazer"
+version = "0.1.0"
+edition = "2024"
+authors = ["Leo Matyushkin"]
+description = "Pure Rust eye tracking library"
+license = "MIT"
+repository = "https://github.com/matyushkin/gazer"
+keywords = ["eye-tracking", "gaze", "pupil", "computer-vision"]
+categories = ["computer-vision", "multimedia"]
+
+[dependencies]
