@@ -48,6 +48,47 @@ fn load(p: &str) -> Model {
     tract_onnx::onnx().model_for_path(p).unwrap().into_optimized().unwrap().into_runnable().unwrap()
 }
 
+/// Smooth pursuit trajectory: horizontal meander (4 sweeps) + vertical meander (4 sweeps).
+/// Total duration: 18 seconds, ~150-200 samples at 10 FPS.
+/// Returns target position at time `t` seconds.
+fn pursuit_target(t: f64, sw: f64, sh: f64) -> (f64, f64) {
+    let mx = sw * 0.1;
+    let my = sh * 0.1;
+    let usable_w = sw - 2.0 * mx;
+    let usable_h = sh - 2.0 * my;
+
+    // 0-9 sec: horizontal meander (4 horizontal sweeps stepping down)
+    // 9-18 sec: vertical meander (4 vertical sweeps stepping right)
+    if t < 9.0 {
+        let phase = t / 9.0; // 0..1
+        let sweep_progress = phase * 4.0; // 0..4
+        let sweep_idx = sweep_progress.floor() as usize;
+        let local = sweep_progress - sweep_idx as f64; // 0..1 within sweep
+
+        let y = my + usable_h * (sweep_idx as f64 + 0.5) / 4.0;
+        // Even sweeps go left→right, odd sweeps go right→left
+        let x = if sweep_idx % 2 == 0 {
+            mx + usable_w * local
+        } else {
+            mx + usable_w * (1.0 - local)
+        };
+        (x, y)
+    } else {
+        let phase = (t - 9.0) / 9.0;
+        let sweep_progress = phase * 4.0;
+        let sweep_idx = sweep_progress.floor() as usize;
+        let local = sweep_progress - sweep_idx as f64;
+
+        let x = mx + usable_w * (sweep_idx as f64 + 0.5) / 4.0;
+        let y = if sweep_idx % 2 == 0 {
+            my + usable_h * local
+        } else {
+            my + usable_h * (1.0 - local)
+        };
+        (x, y)
+    }
+}
+
 /// 9-point calibration grid: 8 perimeter points first, center LAST (WebGazer order).
 fn calib_points(w: usize, h: usize) -> Vec<(f64, f64)> {
     let mx = w as f64 * 0.1;
@@ -131,6 +172,11 @@ fn main() {
     let mut no_face = 0u32;
     // Skip face detection on most frames (rustface ~30ms at 480x270)
     let mut frame_n = 0u64;
+
+    // Smooth pursuit phase — disabled by default. Made things worse (E11 in EXPERIMENTS.md).
+    let mut pursuit_active = false;
+    let mut pursuit_start_ms: u64 = 0;
+    let pursuit_duration_ms: u64 = 18_000;
 
     // Multi-point validation: 5 different targets, click each one,
     // we measure error vs prediction for each
@@ -412,6 +458,75 @@ fn main() {
                 }
             } else if mouse_edge {
                 println!("  Click was {:.0}px away from target — click closer to the red dot", click_dist);
+            }
+        }
+
+        // --- Smooth pursuit phase: animated trajectory after click calibration ---
+        if pursuit_active {
+            let elapsed = now_ms.saturating_sub(pursuit_start_ms);
+            let t = elapsed as f64 / 1000.0;
+            let (ptx, pty) = pursuit_target(t, sw as f64, sh as f64);
+
+            // Draw moving dot
+            draw_filled_circle(&mut buf, sw, sh, ptx as usize, pty as usize, 16, 0xCC0000);
+            draw_ring(&mut buf, sw, sh, ptx as usize, pty as usize, 22, 0x000000);
+            draw_filled_circle(&mut buf, sw, sh, ptx as usize, pty as usize, 4, 0xFFFFFF);
+
+            // Draw faint trail (last few seconds)
+            for back in 1..20 {
+                let prev_t = (t - back as f64 * 0.05).max(0.0);
+                if prev_t > 0.0 {
+                    let (px, py) = pursuit_target(prev_t, sw as f64, sh as f64);
+                    let alpha = 1.0 - back as f64 / 20.0;
+                    let gray = (200.0 - 50.0 * alpha) as u32;
+                    let color = (gray << 16) | (gray << 8) | gray;
+                    draw_filled_circle(&mut buf, sw, sh, px as usize, py as usize, 2, color);
+                }
+            }
+
+            // Progress bar at bottom
+            let progress = (elapsed as f64 / pursuit_duration_ms as f64).min(1.0);
+            let bar_w = (sw as f64 * 0.5) as usize;
+            let bar_x = (sw - bar_w) / 2;
+            let bar_y = sh - 50;
+            for x in 0..bar_w { for y in 0..10 { if bar_y+y < sh { buf[(bar_y+y)*sw+bar_x+x] = 0xCCCCCC; }}}
+            let filled = (bar_w as f64 * progress) as usize;
+            for x in 0..filled { for y in 0..10 { if bar_y+y < sh { buf[(bar_y+y)*sw+bar_x+x] = 0xCC0000; }}}
+
+            // Collect sample every frame after a brief delay (let user catch up)
+            // Smooth pursuit has ~100-150ms latency, so we offset the target by that
+            // (predict where the user is actually looking now, not where the dot is now)
+            let lag_ms = 150.0;
+            let lagged_t = (t * 1000.0 - lag_ms).max(0.0) / 1000.0;
+            let (sample_tx, sample_ty) = pursuit_target(lagged_t, sw as f64, sh as f64);
+
+            if elapsed > 500 && elapsed < pursuit_duration_ms {
+                if let Some(feats) = &current_features {
+                    ridge_reg.add_sample(feats.clone(), sample_tx as f32, sample_ty as f32);
+                    session.calibration.push(CalibFrame {
+                        features: feats.clone(),
+                        target_x: sample_tx as f32,
+                        target_y: sample_ty as f32,
+                    });
+                }
+            }
+
+            // Finish pursuit
+            if elapsed >= pursuit_duration_ms {
+                pursuit_active = false;
+                println!("\nPursuit done. Total samples: {}", ridge_reg.sample_count());
+                // Now run auto-tune lambda on full enriched buffer
+                let candidates = [1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
+                if let Some(best_lam) = ridge_reg.auto_lambda(&candidates) {
+                    let loo_err = ridge_reg.loo_error(best_lam);
+                    ridge_reg.set_lambda(best_lam);
+                    println!("Auto λ={best_lam:.0e} (LOO err: {loo_err:.0} px)");
+                }
+                println!("Now click each blue dot.");
+                validation_idx = 0;
+                validation_results.clear();
+                gaze_history.clear();
+                one_euro.reset();
             }
         }
 

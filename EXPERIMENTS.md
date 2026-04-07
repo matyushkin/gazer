@@ -159,6 +159,36 @@ A correct Sugano implementation matched to a specific CNN's training would take
 
 ---
 
+### E11. Smooth pursuit calibration phase — **FAILED**
+
+**Approach:** After 9-point click calibration, add an animated trajectory phase
+where a dot traces a horizontal+vertical meander pattern over 18 seconds.
+User follows with eyes (smooth pursuit reflex). Each frame becomes a (features,
+target) pair, adding ~155 samples to the existing 45 clicks.
+
+**Hypothesis:** More samples + uniform screen coverage = better fit.
+This is the literature recipe (Pursuits, Vidal et al. 2013).
+
+**Result:** Mean error **329 px** (vs 142 px clicks-only) — **MUCH WORSE**.
+
+**Why it failed:**
+1. **Buffer overflow**: cap=200 samples means clicks were diluted by pursuit data
+2. **Smooth pursuit lag** (100-200 ms) means each "current" gaze is at the target's
+   PAST position — I tried to compensate with `lag_ms=150` but probably wrong
+3. **Saccades during pursuit**: when user loses tracking and catches up,
+   those frames have completely wrong (gaze, target) pairs
+4. **Continuous samples are noisier** than steady fixations
+
+**To make it work would require:**
+- Velocity-based saccade filtering (drop samples when eye velocity ≠ target velocity)
+- Per-sample weighting (clicks weight=10, pursuit weight=1)
+- Larger buffer (1000+) so clicks aren't evicted
+- Better lag estimation per user
+
+**Status:** Disabled by default. Revert if velocity filtering is implemented.
+
+---
+
 ### E10. White background lighting hack — **BIG WIN**
 
 **Approach:** Clear screen buffer to white (0xFFFFFF) instead of black during
