@@ -23,6 +23,9 @@ use rustface::ImageData;
 use saccade::calib_state::{CalibrationState, EventResult, Phase};
 use saccade::one_euro::OneEuroFilter2D;
 use saccade::ridge::{self, RidgeRegressor, BOTH_EYES_FEAT_LEN};
+
+const HEAD_POSE_FEAT_LEN: usize = 6;
+const TOTAL_FEAT_LEN: usize = BOTH_EYES_FEAT_LEN + HEAD_POSE_FEAT_LEN; // 126
 use saccade::session::{CalibFrame, Session, ValidFrame};
 use std::time::Instant;
 use tract_onnx::prelude::*;
@@ -105,11 +108,11 @@ fn main() {
     window.set_target_fps(60);
     println!("Window opened. CLICK ON IT to give it focus, then press SPACE.");
 
-    // Ridge regressor — moderate λ from multi-point benchmark (best at 1e4)
+    // Ridge regressor — eye features + 6 head pose features = 126-D
     let mut ridge_reg = RidgeRegressor::new(
         200,                 // larger buffer — accumulate user clicks during use
-        1e4,                 // moderate ridge — best on multi-point validation
-        BOTH_EYES_FEAT_LEN,
+        1e4,                 // initial guess; auto-tuned via LOO CV after calibration
+        TOTAL_FEAT_LEN,
     );
 
     // Heavy smoothing: 16-point moving average + 1€ filter
@@ -119,9 +122,8 @@ fn main() {
     const SMOOTHING_WINDOW: usize = 16;
 
     let targets = calib_points(sw, sh);
-    // Offline benchmark showed ~20 samples is optimal — use 2 per point × 9 = 18.
-    // More clicks → user fatigue → less accurate → worse fit.
-    const SAMPLES_PER_POINT: u32 = 2;
+    // 5 clicks per point × 9 = 45 — same as WebGazer's recommended calibration
+    const SAMPLES_PER_POINT: u32 = 5;
     let mut calib = CalibrationState::new(targets.len(), SAMPLES_PER_POINT);
 
     let mut buf = vec![0u32; sw * sh];
@@ -273,9 +275,33 @@ fn main() {
                 if let (Some((rp, rw, rh)), Some((lp, lw, lh))) = (right_patch, left_patch) {
                     let r_feat = ridge::extract_eye_features(&rp, rw, rh);
                     let l_feat = ridge::extract_eye_features(&lp, lw, lh);
-                    let mut combined = Vec::with_capacity(BOTH_EYES_FEAT_LEN);
+
+                    // Head pose features (6) — scaled to similar magnitude as eye pixel features (~100)
+                    // face_x, face_y normalized to [0, 100] across image
+                    let head_x = (fx as f32 + fwf as f32 / 2.0) / cw as f32 * 100.0;
+                    let head_y = (fy as f32 + fhf as f32 / 2.0) / ch as f32 * 100.0;
+                    let head_w = fwf as f32 / cw as f32 * 100.0;
+                    let head_h = fhf as f32 / ch as f32 * 100.0;
+                    // Head roll from eye corners (right outer 36 to left outer 45)
+                    let dx = lm[45].0 - lm[36].0;
+                    let dy = lm[45].1 - lm[36].1;
+                    let head_roll = dy.atan2(dx) * 100.0; // radians × 100 ≈ pixel scale
+                    // Inter-eye distance (proxy for camera distance)
+                    let r_eye_cx = (lm[36].0 + lm[39].0) / 2.0;
+                    let l_eye_cx = (lm[42].0 + lm[45].0) / 2.0;
+                    let r_eye_cy = (lm[36].1 + lm[39].1) / 2.0;
+                    let l_eye_cy = (lm[42].1 + lm[45].1) / 2.0;
+                    let inter_eye = ((l_eye_cx - r_eye_cx).powi(2) + (l_eye_cy - r_eye_cy).powi(2)).sqrt();
+
+                    let mut combined = Vec::with_capacity(TOTAL_FEAT_LEN);
                     combined.extend_from_slice(&r_feat);
                     combined.extend_from_slice(&l_feat);
+                    combined.push(head_x);
+                    combined.push(head_y);
+                    combined.push(head_w);
+                    combined.push(head_h);
+                    combined.push(head_roll);
+                    combined.push(inter_eye);
                     current_features = Some(combined);
                 }
             }
@@ -365,7 +391,17 @@ fn main() {
                                 target_y: ty as f32,
                             });
                         }
-                        println!("\nCalibration done: {} samples. Now click each blue dot.", ridge_reg.sample_count());
+                        // Auto-tune lambda via leave-one-out cross-validation
+                        let candidates = [1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
+                        if let Some(best_lam) = ridge_reg.auto_lambda(&candidates) {
+                            let loo_err = ridge_reg.loo_error(best_lam);
+                            ridge_reg.set_lambda(best_lam);
+                            println!("\nCalibration done: {} samples. Auto λ={best_lam:.0e} (LOO err: {loo_err:.0} px)",
+                                ridge_reg.sample_count());
+                        } else {
+                            println!("\nCalibration done: {} samples.", ridge_reg.sample_count());
+                        }
+                        println!("Now click each blue dot.");
                         validation_idx = 0;
                         validation_results.clear();
                         gaze_history.clear();

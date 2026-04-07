@@ -173,6 +173,73 @@ impl RidgeRegressor {
         self.samples.clear();
     }
 
+    /// Find optimal lambda via leave-one-out cross-validation on stored samples.
+    /// Tries each candidate, computes mean LOO error, returns the best one.
+    pub fn auto_lambda(&self, candidates: &[f64]) -> Option<f64> {
+        if self.samples.len() < 4 {
+            return None;
+        }
+        let mut best_lam = candidates[0];
+        let mut best_err = f64::INFINITY;
+        for &lam in candidates {
+            let err = self.loo_error(lam);
+            if err < best_err {
+                best_err = err;
+                best_lam = lam;
+            }
+        }
+        Some(best_lam)
+    }
+
+    /// Compute mean leave-one-out error for a given lambda.
+    pub fn loo_error(&self, lambda: f64) -> f64 {
+        let n = self.samples.len();
+        if n < 4 {
+            return f64::INFINITY;
+        }
+        let p = self.feat_len;
+        let mut errors = Vec::with_capacity(n);
+        for hold_out in 0..n {
+            // Build training set excluding hold_out
+            let mut x_data = Vec::with_capacity((n - 1) * p);
+            let mut y_x = Vec::with_capacity(n - 1);
+            let mut y_y = Vec::with_capacity(n - 1);
+            for (i, s) in self.samples.iter().enumerate() {
+                if i == hold_out { continue; }
+                for &f in &s.features { x_data.push(f as f64); }
+                y_x.push(s.target_x as f64);
+                y_y.push(s.target_y as f64);
+            }
+            let x_mat = DMatrix::from_row_slice(n - 1, p, &x_data);
+            let xt = x_mat.transpose();
+            let mut xtx = &xt * &x_mat;
+            for i in 0..p { xtx[(i, i)] += lambda; }
+
+            let xty_x = &xt * DVector::from_vec(y_x);
+            let xty_y = &xt * DVector::from_vec(y_y);
+            let decomp = xtx.lu();
+            if let (Some(beta_x), Some(beta_y)) = (decomp.solve(&xty_x), decomp.solve(&xty_y)) {
+                let held = &self.samples[hold_out];
+                let mut px = 0.0f64;
+                let mut py = 0.0f64;
+                for i in 0..p {
+                    px += held.features[i] as f64 * beta_x[i];
+                    py += held.features[i] as f64 * beta_y[i];
+                }
+                let dx = px - held.target_x as f64;
+                let dy = py - held.target_y as f64;
+                errors.push((dx * dx + dy * dy).sqrt());
+            }
+        }
+        if errors.is_empty() { f64::INFINITY }
+        else { errors.iter().sum::<f64>() / errors.len() as f64 }
+    }
+
+    /// Override the lambda (e.g., after auto_lambda picks one).
+    pub fn set_lambda(&mut self, lambda: f64) {
+        self.lambda = lambda;
+    }
+
     /// Solve ridge regression and predict for given features.
     /// Returns None if not enough samples or solver fails.
     pub fn predict(&self, features: &[f32]) -> Option<(f32, f32)> {
@@ -268,6 +335,17 @@ mod tests {
         // Oldest samples (0-4) should be evicted, keeping 5-9
         assert_eq!(reg.samples[0].target_x, 5.0);
         assert_eq!(reg.samples[4].target_x, 9.0);
+    }
+
+    #[test]
+    fn auto_lambda_picks_from_candidates() {
+        let mut reg = RidgeRegressor::new(20, 1e-5, 3);
+        // Linear data: y = 2x + 1
+        for i in 0..10 {
+            reg.add_sample(vec![i as f32, 0.0, 0.0], 2.0 * i as f32 + 1.0, 0.0);
+        }
+        let lam = reg.auto_lambda(&[1e-5, 1e-3, 1e-1, 1.0, 1e3, 1e6]);
+        assert!(lam.is_some());
     }
 
     #[test]

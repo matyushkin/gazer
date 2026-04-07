@@ -28,6 +28,10 @@ name = "webgazer"
 required-features = ["demo"]
 
 [[example]]
+name = "webgazer_cnn"
+required-features = ["demo"]
+
+[[example]]
 name = "replay"
 
 [features]
