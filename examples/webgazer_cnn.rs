@@ -17,8 +17,10 @@ use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 use rustface::ImageData;
+use nalgebra::{Matrix3, Vector3};
 use saccade::calib_state::{CalibrationState, EventResult, Phase};
 use saccade::one_euro::OneEuroFilter2D;
+use saccade::sugano;
 use std::time::Instant;
 use tract_onnx::prelude::*;
 
@@ -26,8 +28,10 @@ type Model = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn Ty
 
 const FACE_M: &str = "seeta_fd_frontal_v1.0.bin";
 const FACE_U: &str = "https://github.com/atomashpolskiy/rustface/raw/master/model/seeta_fd_frontal_v1.0.bin";
-const GAZE_M: &str = "mobileone_s0_gaze.onnx";
-const GAZE_U: &str = "https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0_gaze.onnx";
+const PFLD_M: &str = "pfld.onnx";
+const PFLD_U: &str = "https://github.com/cunjian/pytorch_face_landmark/raw/refs/heads/master/onnx/pfld.onnx";
+const GAZE_M: &str = "resnet18_gaze.onnx";
+const GAZE_U: &str = "https://github.com/yakhyo/gaze-estimation/releases/download/weights/resnet18_gaze.onnx";
 
 fn dl(p: &str, u: &str) {
     if !std::path::Path::new(p).exists() {
@@ -52,29 +56,57 @@ fn calib_points(w: usize, h: usize) -> Vec<(f64, f64)> {
     ]
 }
 
-/// Linear regression: (yaw, pitch) → (screen_x, screen_y).
-/// 6 parameters total: ax, bx, cx, ay, by, cy where
-/// screen_x = ax + bx*yaw + cx*pitch
-/// screen_y = ay + by*yaw + cy*pitch
+/// 2nd-degree polynomial on (yaw, pitch) → (screen_x, screen_y).
+/// 6 features: [1, yaw, pitch, yaw², pitch², yaw·pitch]
+/// Standard recipe from gaze estimation literature.
+const POLY_FEAT_LEN: usize = 6;
+
+#[derive(Clone, Copy)]
+struct CnnSample {
+    yaw: f32,
+    pitch: f32,
+    head_x: f32,
+    head_y: f32,
+    head_w: f32,
+    head_roll: f32,
+    screen_x: f32,
+    screen_y: f32,
+}
+
 struct LinearMapper {
-    samples: Vec<((f32, f32), (f32, f32))>, // ((yaw, pitch), (screen_x, screen_y))
-    coeffs_x: [f64; 3], // [a, b_yaw, c_pitch]
-    coeffs_y: [f64; 3],
+    samples: Vec<CnnSample>,
+    coeffs_x: [f64; POLY_FEAT_LEN],
+    coeffs_y: [f64; POLY_FEAT_LEN],
     fitted: bool,
+    lambda: f64,
+}
+
+fn poly_features(s: &CnnSample) -> [f64; POLY_FEAT_LEN] {
+    let yaw = s.yaw as f64;
+    let pitch = s.pitch as f64;
+    [
+        1.0,
+        yaw,
+        pitch,
+        yaw * yaw,
+        pitch * pitch,
+        yaw * pitch,
+    ]
 }
 
 impl LinearMapper {
     fn new() -> Self {
         Self {
             samples: Vec::new(),
-            coeffs_x: [0.0; 3],
-            coeffs_y: [0.0; 3],
+            coeffs_x: [0.0; POLY_FEAT_LEN],
+            coeffs_y: [0.0; POLY_FEAT_LEN],
             fitted: false,
+            lambda: 1.0,
         }
     }
 
-    fn add(&mut self, yaw: f32, pitch: f32, sx: f32, sy: f32) {
-        self.samples.push(((yaw, pitch), (sx, sy)));
+    fn add(&mut self, yaw: f32, pitch: f32, head_x: f32, head_y: f32, head_w: f32, head_roll: f32, sx: f32, sy: f32) {
+        self.samples.push(CnnSample { yaw, pitch, head_x, head_y, head_w, head_roll, screen_x: sx, screen_y: sy });
     }
 
     fn clear(&mut self) {
@@ -82,61 +114,67 @@ impl LinearMapper {
         self.fitted = false;
     }
 
-    /// Fit via normal equations: solve [1, yaw, pitch] @ β = screen.
+    /// Fit ridge regression on polynomial features via nalgebra.
     fn fit(&mut self) -> bool {
+        use nalgebra::{DMatrix, DVector};
         let n = self.samples.len();
         if n < 3 { return false; }
+        let p = POLY_FEAT_LEN;
 
-        // Design matrix A (n × 3) and targets bx, by
-        let mut a = vec![0.0f64; n * 3];
-        let mut bx = vec![0.0f64; n];
-        let mut by = vec![0.0f64; n];
-        for (i, ((yaw, pitch), (sx, sy))) in self.samples.iter().enumerate() {
-            a[i*3]   = 1.0;
-            a[i*3+1] = *yaw as f64;
-            a[i*3+2] = *pitch as f64;
-            bx[i] = *sx as f64;
-            by[i] = *sy as f64;
+        let mut x_data = Vec::with_capacity(n * p);
+        let mut y_x = Vec::with_capacity(n);
+        let mut y_y = Vec::with_capacity(n);
+        for s in &self.samples {
+            let f = poly_features(s);
+            x_data.extend_from_slice(&f);
+            y_x.push(s.screen_x as f64);
+            y_y.push(s.screen_y as f64);
         }
 
-        // AᵀA (3×3)
-        let mut ata = [[0.0f64; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                let mut s = 0.0;
-                for k in 0..n { s += a[k*3+i] * a[k*3+j]; }
-                ata[i][j] = s;
+        let x_mat = DMatrix::from_row_slice(n, p, &x_data);
+        let xt = x_mat.transpose();
+        let mut xtx = &xt * &x_mat;
+        for i in 0..p { xtx[(i, i)] += self.lambda; }
+
+        let xty_x = &xt * DVector::from_vec(y_x);
+        let xty_y = &xt * DVector::from_vec(y_y);
+        let decomp = xtx.lu();
+        if let (Some(beta_x), Some(beta_y)) = (decomp.solve(&xty_x), decomp.solve(&xty_y)) {
+            for i in 0..p {
+                self.coeffs_x[i] = beta_x[i];
+                self.coeffs_y[i] = beta_y[i];
             }
+            self.fitted = true;
+            true
+        } else {
+            false
         }
-        // Add tiny ridge for stability
-        for i in 0..3 { ata[i][i] += 1e-6; }
-
-        let mut atbx = [0.0f64; 3];
-        let mut atby = [0.0f64; 3];
-        for i in 0..3 {
-            for k in 0..n {
-                atbx[i] += a[k*3+i] * bx[k];
-                atby[i] += a[k*3+i] * by[k];
-            }
-        }
-
-        // Solve 3×3 system via Cramer or Gaussian — use Cramer
-        let det = det3(&ata);
-        if det.abs() < 1e-12 { return false; }
-        for i in 0..3 {
-            let mut a_x = ata; let mut a_y = ata;
-            for r in 0..3 { a_x[r][i] = atbx[r]; a_y[r][i] = atby[r]; }
-            self.coeffs_x[i] = det3(&a_x) / det;
-            self.coeffs_y[i] = det3(&a_y) / det;
-        }
-        self.fitted = true;
-        true
     }
 
-    fn predict(&self, yaw: f32, pitch: f32) -> Option<(f32, f32)> {
+    /// Auto-tune lambda via leave-one-out CV.
+    fn auto_tune(&mut self) {
+        let candidates = [1e-3, 1e-1, 1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6];
+        let mut best = self.lambda;
+        let mut best_err = f64::INFINITY;
+        for &lam in &candidates {
+            self.lambda = lam;
+            let err = self.loo_error();
+            if err < best_err { best_err = err; best = lam; }
+        }
+        self.lambda = best;
+        self.fit();
+    }
+
+    fn predict(&self, yaw: f32, pitch: f32, head_x: f32, head_y: f32, head_w: f32, head_roll: f32) -> Option<(f32, f32)> {
         if !self.fitted { return None; }
-        let sx = self.coeffs_x[0] + self.coeffs_x[1] * yaw as f64 + self.coeffs_x[2] * pitch as f64;
-        let sy = self.coeffs_y[0] + self.coeffs_y[1] * yaw as f64 + self.coeffs_y[2] * pitch as f64;
+        let s = CnnSample { yaw, pitch, head_x, head_y, head_w, head_roll, screen_x: 0.0, screen_y: 0.0 };
+        let f = poly_features(&s);
+        let mut sx = 0.0f64;
+        let mut sy = 0.0f64;
+        for i in 0..POLY_FEAT_LEN {
+            sx += self.coeffs_x[i] * f[i];
+            sy += self.coeffs_y[i] * f[i];
+        }
         Some((sx as f32, sy as f32))
     }
 
@@ -146,14 +184,17 @@ impl LinearMapper {
         let mut errors = Vec::new();
         for i in 0..n {
             let mut tmp = LinearMapper::new();
+            tmp.lambda = self.lambda;
             for (j, s) in self.samples.iter().enumerate() {
-                if j != i { tmp.add(s.0.0, s.0.1, s.1.0, s.1.1); }
+                if j != i {
+                    tmp.add(s.yaw, s.pitch, s.head_x, s.head_y, s.head_w, s.head_roll, s.screen_x, s.screen_y);
+                }
             }
             if !tmp.fit() { continue; }
             let held = &self.samples[i];
-            if let Some((px, py)) = tmp.predict(held.0.0, held.0.1) {
-                let dx = px as f64 - held.1.0 as f64;
-                let dy = py as f64 - held.1.1 as f64;
+            if let Some((px, py)) = tmp.predict(held.yaw, held.pitch, held.head_x, held.head_y, held.head_w, held.head_roll) {
+                let dx = px as f64 - held.screen_x as f64;
+                let dy = py as f64 - held.screen_y as f64;
                 errors.push((dx*dx + dy*dy).sqrt());
             }
         }
@@ -162,19 +203,15 @@ impl LinearMapper {
     }
 }
 
-fn det3(m: &[[f64;3];3]) -> f64 {
-    m[0][0]*(m[1][1]*m[2][2] - m[1][2]*m[2][1])
-    - m[0][1]*(m[1][0]*m[2][2] - m[1][2]*m[2][0])
-    + m[0][2]*(m[1][0]*m[2][1] - m[1][1]*m[2][0])
-}
-
 fn main() {
     dl(FACE_M, FACE_U);
+    dl(PFLD_M, PFLD_U);
     dl(GAZE_M, GAZE_U);
 
     let mut face_det = rustface::create_detector(FACE_M).expect("face model");
     face_det.set_min_face_size(80);
     face_det.set_score_thresh(2.0);
+    let pfld = load(PFLD_M);
     let gaze_net = load(GAZE_M);
 
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
@@ -209,8 +246,8 @@ fn main() {
     let mut one_euro = OneEuroFilter2D::new(1.0, 0.05, 1.0);
 
     let targets = calib_points(sw, sh);
-    // Only 1 click per point — linear mapping is simple, doesn't need many samples
-    const SAMPLES_PER_POINT: u32 = 2;
+    // 5 clicks per point — polynomial fit needs more samples to be stable
+    const SAMPLES_PER_POINT: u32 = 5;
     let mut calib = CalibrationState::new(targets.len(), SAMPLES_PER_POINT);
 
     let validation_targets: Vec<(f64, f64)> = vec![
@@ -227,6 +264,7 @@ fn main() {
     let mut buf = vec![0u32; sw * sh];
     let mut face_sm = SmRect::new(0.3);
     let mut frame_n = 0u64;
+    let mut last_gaze: Option<(f32, f32)> = None; // cached CNN output
 
     let pip_w = 240usize;
     let pip_h = pip_w * ch / cw;
@@ -298,7 +336,8 @@ fn main() {
         }}
         draw_rect(&mut buf, sw, sh, pip_x.saturating_sub(1), pip_y.saturating_sub(1), pip_w+2, pip_h+2, 0xFFFFFF);
 
-        let mut current_gaze: Option<(f32, f32)> = None;
+        // current sample: (yaw, pitch, head_x, head_y, head_w, head_roll)
+        let mut current_sample: Option<(f32, f32, f32, f32, f32, f32)> = None;
         if let Some(face) = detected {
             let bb = face.bbox();
             face_sm.update(bb.x().max(0) as f64, bb.y().max(0) as f64, bb.width() as f64, bb.height() as f64);
@@ -306,9 +345,62 @@ fn main() {
 
         if face_sm.init {
             let (fx, fy, fwf, fhf) = face_sm.get();
-            // Run MobileGaze on face crop
-            if let Some((yaw, pitch)) = run_gaze(&gaze_net, &rgb, cw, ch, fx, fy, fwf, fhf) {
-                current_gaze = Some((yaw, pitch));
+
+            // Run PFLD landmarks
+            if let Some(lm) = run_pfld(&pfld, &gray, cw, ch, fx, fy, fwf, fhf) {
+                // 6 anchor landmarks for PnP (matching face_model_3d order):
+                // 36, 39, 42, 45 (eye corners), 48, 54 (mouth corners)
+                let img_pts: [(f64, f64); 6] = [
+                    (lm[36].0 as f64, lm[36].1 as f64),
+                    (lm[39].0 as f64, lm[39].1 as f64),
+                    (lm[42].0 as f64, lm[42].1 as f64),
+                    (lm[45].0 as f64, lm[45].1 as f64),
+                    (lm[48].0 as f64, lm[48].1 as f64),
+                    (lm[54].0 as f64, lm[54].1 as f64),
+                ];
+
+                // Solve PnP — focal length ~ image width (approximation for unknown camera)
+                let focal = cw as f64;
+                if let Some((rotation, translation)) =
+                    sugano::solve_pnp(&img_pts, focal, cw as f64, ch as f64)
+                {
+                    // Eye center 3D = midpoint of eye corners in camera frame
+                    // Use actual camera-frame eye center (rotated face model + translation)
+                    let model = sugano::face_model_3d();
+                    let r_eye_3d = rotation * model[0] + translation; // outer right
+                    let l_eye_3d = rotation * model[3] + translation; // outer left
+                    let eye_center_3d = (r_eye_3d + l_eye_3d) * 0.5;
+
+                    // Run gaze every 2nd frame on normalized crop
+                    let do_gaze = frame_n % 2 == 0 || last_gaze.is_none();
+                    if do_gaze {
+                        let normalized = sugano::normalize_eye_crop(
+                            &rgb, cw, ch,
+                            eye_center_3d,
+                            rotation,
+                            focal,
+                            448, 448,
+                            600.0,   // virtual distance: 600 mm
+                            1600.0,  // virtual focal length
+                        );
+                        if let Some((yaw_n, pitch_n)) = run_gaze_from_buffer(&gaze_net, &normalized, 448, 448) {
+                            // Denormalize back to real camera frame
+                            let r_norm = build_normalization_rotation(&rotation, &eye_center_3d);
+                            let (yaw, pitch) = sugano::denormalize_gaze(yaw_n, pitch_n, &r_norm);
+                            last_gaze = Some((yaw, pitch));
+                        }
+                    }
+                }
+            }
+
+            // Head pose features (still useful for polynomial mapper)
+            let head_x = (fx as f32 + fwf as f32 / 2.0) / cw as f32 * 100.0;
+            let head_y = (fy as f32 + fhf as f32 / 2.0) / ch as f32 * 100.0;
+            let head_w = fwf as f32 / cw as f32 * 100.0;
+            let head_roll = 0.0f32;
+
+            if let Some((yaw, pitch)) = last_gaze {
+                current_sample = Some((yaw, pitch, head_x, head_y, head_w, head_roll));
             }
         }
 
@@ -329,30 +421,30 @@ fn main() {
 
             let click_dist = ((mouse_pos.0 as f64 - tx).powi(2) + (mouse_pos.1 as f64 - ty).powi(2)).sqrt();
             if mouse_edge && click_dist < 80.0 {
-                let has = current_gaze.is_some();
+                let has = current_sample.is_some();
                 let result = calib.handle_capture(has);
                 match result {
                     EventResult::SampleCaptured { point, sample } => {
-                        if let Some((yaw, pitch)) = current_gaze {
-                            mapper.add(yaw, pitch, tx as f32, ty as f32);
+                        if let Some((yaw, pitch, hx, hy, hw, hr)) = current_sample {
+                            mapper.add(yaw, pitch, hx, hy, hw, hr, tx as f32, ty as f32);
                         }
                         println!("  Point {}/{} sample {}/{}", point + 1, targets.len(), sample, SAMPLES_PER_POINT);
                     }
                     EventResult::NextPoint { point } => {
-                        if let Some((yaw, pitch)) = current_gaze {
-                            mapper.add(yaw, pitch, tx as f32, ty as f32);
+                        if let Some((yaw, pitch, hx, hy, hw, hr)) = current_sample {
+                            mapper.add(yaw, pitch, hx, hy, hw, hr, tx as f32, ty as f32);
                         }
                         println!("  Point {} done, next: {}/{}", calib_idx + 1, point + 1, targets.len());
                     }
                     EventResult::CalibrationComplete => {
-                        if let Some((yaw, pitch)) = current_gaze {
-                            mapper.add(yaw, pitch, tx as f32, ty as f32);
+                        if let Some((yaw, pitch, hx, hy, hw, hr)) = current_sample {
+                            mapper.add(yaw, pitch, hx, hy, hw, hr, tx as f32, ty as f32);
                         }
-                        if mapper.fit() {
-                            let loo = mapper.loo_error();
-                            println!("\nCalibration done: {} samples. LOO error: {loo:.0} px",
-                                mapper.samples.len());
-                        }
+                        // Auto-tune lambda via LOO CV
+                        mapper.auto_tune();
+                        let loo = mapper.loo_error();
+                        println!("\nCalibration done: {} samples. λ={:.0e} LOO err: {loo:.0} px",
+                            mapper.samples.len(), mapper.lambda);
                         validation_idx = 0;
                         validation_results.clear();
                         one_euro.reset();
@@ -381,8 +473,8 @@ fn main() {
             let mp = window.get_mouse_pos(MouseMode::Discard).unwrap_or((0.0, 0.0));
             let click_dist = ((mp.0 as f64 - vtx).powi(2) + (mp.1 as f64 - vty).powi(2)).sqrt();
             if val_edge && click_dist < 80.0 {
-                if let Some((yaw, pitch)) = current_gaze {
-                    if let Some((px, py)) = mapper.predict(yaw, pitch) {
+                if let Some((yaw, pitch, hx, hy, hw, hr)) = current_sample {
+                    if let Some((px, py)) = mapper.predict(yaw, pitch, hx, hy, hw, hr) {
                         let px = (px as f64).clamp(0.0, sw as f64 - 1.0);
                         let py = (py as f64).clamp(0.0, sh as f64 - 1.0);
                         validation_results.push((px, py, vtx, vty));
@@ -429,14 +521,14 @@ fn main() {
         // Running phase
         if calib.phase() == Phase::Running {
             if mouse_edge {
-                if let Some((yaw, pitch)) = current_gaze {
-                    mapper.add(yaw, pitch, mouse_pos.0 as f32, mouse_pos.1 as f32);
+                if let Some((yaw, pitch, hx, hy, hw, hr)) = current_sample {
+                    mapper.add(yaw, pitch, hx, hy, hw, hr, mouse_pos.0 as f32, mouse_pos.1 as f32);
                     mapper.fit();
                     println!("  +1 sample, total {}", mapper.samples.len());
                 }
             }
-            if let Some((yaw, pitch)) = current_gaze {
-                if let Some((px, py)) = mapper.predict(yaw, pitch) {
+            if let Some((yaw, pitch, hx, hy, hw, hr)) = current_sample {
+                if let Some((px, py)) = mapper.predict(yaw, pitch, hx, hy, hw, hr) {
                     let cx = (px as f64).clamp(0.0, sw as f64 - 1.0);
                     let cy = (py as f64).clamp(0.0, sh as f64 - 1.0);
                     let t_sec = now_ms as f64 / 1000.0;
@@ -464,10 +556,56 @@ fn main() {
             };
             print!("\r[{mode}] FPS:{f:.0} | samples:{} | gaze:{}    ",
                 mapper.samples.len(),
-                if current_gaze.is_some() { "ok" } else { "?" });
+                if current_sample.is_some() { "ok" } else { "?" });
         }
     }
     println!("\nDone.");
+}
+
+/// Build the normalization rotation R_n that aligns the eye center to camera z-axis.
+/// (Same as inside sugano::normalize_eye_crop, but exposed for denormalization.)
+fn build_normalization_rotation(rotation: &Matrix3<f64>, eye_center_3d: &Vector3<f64>) -> Matrix3<f64> {
+    let z_axis = eye_center_3d / eye_center_3d.norm();
+    let head_x = rotation.column(0).into_owned();
+    let mut x_axis = head_x - z_axis * head_x.dot(&z_axis);
+    let xn = x_axis.norm();
+    if xn < 1e-6 {
+        x_axis = Vector3::new(1.0, 0.0, 0.0);
+    } else {
+        x_axis /= xn;
+    }
+    let y_axis = z_axis.cross(&x_axis);
+    Matrix3::from_columns(&[x_axis, y_axis, z_axis]).transpose()
+}
+
+/// Run gaze CNN on a pre-normalized RGB buffer (already 448×448).
+fn run_gaze_from_buffer(model: &Model, rgb: &[u8], w: usize, h: usize) -> Option<(f32, f32)> {
+    if w != 448 || h != 448 || rgb.len() != w * h * 3 { return None; }
+    let sz = 448;
+    let mean = [0.485f32, 0.456, 0.406];
+    let std = [0.229f32, 0.224, 0.225];
+    let mut data = vec![0.0f32; 3*sz*sz];
+    for y in 0..sz { for x in 0..sz {
+        let si = (y*sz+x)*3;
+        for c in 0..3 { data[c*sz*sz+y*sz+x] = (rgb[si+c] as f32 / 255.0 - mean[c]) / std[c]; }
+    }}
+    let t = Tensor::from(tract_ndarray::Array4::from_shape_vec((1,3,sz,sz), data).ok()?).into();
+    let r = model.run(tvec![t]).ok()?;
+    let yaw_view = r[0].to_array_view::<f32>().ok()?;
+    let pitch_view = r[1].to_array_view::<f32>().ok()?;
+    Some((bins_to_angle(yaw_view.as_slice()?), bins_to_angle(pitch_view.as_slice()?)))
+}
+
+fn run_pfld(m: &Model, g: &[u8], w: usize, h: usize, fx: usize, fy: usize, fw: usize, fh: usize) -> Option<Vec<(f32,f32)>> {
+    if fx+fw>w||fy+fh>h||fw<20||fh<20 { return None; }
+    let s=112; let mut d=vec![0.0f32;3*s*s];
+    for y in 0..s{for x in 0..s{let(sx,sy)=(fx+x*fw/s,fy+y*fh/s);let v=if sx<w&&sy<h{g[sy*w+sx]as f32/255.0}else{0.0};d[y*s+x]=v;d[s*s+y*s+x]=v;d[2*s*s+y*s+x]=v;}}
+    let t = Tensor::from(tract_ndarray::Array4::from_shape_vec((1,3,s,s),d).ok()?).into();
+    let r = m.run(tvec![t]).ok()?;
+    let out = r[0].to_array_view::<f32>().ok()?;
+    let flat = out.as_slice()?;
+    if flat.len()<136{return None;}
+    Some((0..68).map(|i|(flat[i*2]*fw as f32+fx as f32, flat[i*2+1]*fh as f32+fy as f32)).collect())
 }
 
 fn run_gaze(model: &Model, rgb: &[u8], w: usize, h: usize, fx: usize, fy: usize, fw: usize, fh: usize) -> Option<(f32, f32)> {

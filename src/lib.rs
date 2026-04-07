@@ -28,3 +28,4 @@ pub mod one_euro;
 pub mod ridge;
 pub mod calib_state;
 pub mod session;
+pub mod sugano;
