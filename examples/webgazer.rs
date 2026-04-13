@@ -22,10 +22,11 @@ use nokhwa::Camera;
 use rustface::ImageData;
 use saccade::calib_state::{CalibrationState, EventResult, Phase};
 use saccade::one_euro::OneEuroFilter2D;
-use saccade::ridge::{self, RidgeRegressor, BOTH_EYES_FEAT_LEN};
+use saccade::ridge::{self, RidgeRegressor, RidgeSample, BOTH_EYES_FEAT_LEN};
 
 const HEAD_POSE_FEAT_LEN: usize = 6;
 const TOTAL_FEAT_LEN: usize = BOTH_EYES_FEAT_LEN + HEAD_POSE_FEAT_LEN; // 126
+const EAR_BLINK_THRESHOLD: f32 = 0.15;
 use saccade::session::{CalibFrame, Session, ValidFrame};
 use std::time::Instant;
 use tract_onnx::prelude::*;
@@ -86,6 +87,124 @@ fn pursuit_target(t: f64, sw: f64, sh: f64) -> (f64, f64) {
             my + usable_h * (1.0 - local)
         };
         (x, y)
+    }
+}
+
+/// 5x5 grid calibration: 25 cells with random number labels.
+/// User clicks numbers 1..25 in order, each click adds a sample.
+fn grid_5x5_centers(w: usize, h: usize) -> Vec<(f64, f64)> {
+    let mx = w as f64 * 0.08;
+    let my = h as f64 * 0.08;
+    let usable_w = w as f64 - 2.0 * mx;
+    let usable_h = h as f64 - 2.0 * my;
+    let mut pts = Vec::with_capacity(25);
+    for row in 0..5 {
+        for col in 0..5 {
+            // Cell center
+            let cx = mx + usable_w * (col as f64 + 0.5) / 5.0;
+            let cy = my + usable_h * (row as f64 + 0.5) / 5.0;
+            pts.push((cx, cy));
+        }
+    }
+    pts
+}
+
+/// Build a random permutation of 1..25 → maps cell index → number to display.
+fn random_number_map() -> [u32; 25] {
+    let mut nums: [u32; 25] = std::array::from_fn(|i| (i + 1) as u32);
+    // Fisher-Yates shuffle using time-based seed
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(12345);
+    let mut state = seed;
+    for i in (1..25).rev() {
+        // xorshift
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state % (i as u64 + 1)) as usize;
+        nums.swap(i, j);
+    }
+    nums
+}
+
+/// Draw a digit (0-9) as a 7-segment style block at (cx, cy).
+/// Each segment is a thick line. Total digit size ~30×50 px.
+fn draw_digit(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, digit: u32, color: u32) {
+    // 7-segment layout:
+    //  aaa
+    // f   b
+    // f   b
+    //  ggg
+    // e   c
+    // e   c
+    //  ddd
+    let segments: [bool; 7] = match digit {
+        0 => [true, true, true, true, true, true, false],
+        1 => [false, true, true, false, false, false, false],
+        2 => [true, true, false, true, true, false, true],
+        3 => [true, true, true, true, false, false, true],
+        4 => [false, true, true, false, false, true, true],
+        5 => [true, false, true, true, false, true, true],
+        6 => [true, false, true, true, true, true, true],
+        7 => [true, true, true, false, false, false, false],
+        8 => [true, true, true, true, true, true, true],
+        9 => [true, true, true, true, false, true, true],
+        _ => [false; 7],
+    };
+    let half_w = 14i32;
+    let half_h = 22i32;
+    let thick = 4i32;
+
+    let draw_h_seg = |buf: &mut [u32], y_offset: i32| {
+        for dy in -thick/2..=thick/2 {
+            for dx in (-half_w + 4)..(half_w - 3) {
+                let x = cx as i32 + dx;
+                let y = cy as i32 + y_offset + dy;
+                if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+                    buf[y as usize * w + x as usize] = color;
+                }
+            }
+        }
+    };
+    let draw_v_seg = |buf: &mut [u32], x_offset: i32, y_start: i32, y_end: i32| {
+        for dy in y_start..=y_end {
+            for dx in -thick/2..=thick/2 {
+                let x = cx as i32 + x_offset + dx;
+                let y = cy as i32 + dy;
+                if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+                    buf[y as usize * w + x as usize] = color;
+                }
+            }
+        }
+    };
+
+    // a: top horizontal
+    if segments[0] { draw_h_seg(buf, -half_h); }
+    // b: top right vertical
+    if segments[1] { draw_v_seg(buf, half_w - 4, -half_h + 3, -2); }
+    // c: bottom right vertical
+    if segments[2] { draw_v_seg(buf, half_w - 4, 2, half_h - 3); }
+    // d: bottom horizontal
+    if segments[3] { draw_h_seg(buf, half_h); }
+    // e: bottom left vertical
+    if segments[4] { draw_v_seg(buf, -half_w + 4, 2, half_h - 3); }
+    // f: top left vertical
+    if segments[5] { draw_v_seg(buf, -half_w + 4, -half_h + 3, -2); }
+    // g: middle horizontal
+    if segments[6] { draw_h_seg(buf, 0); }
+}
+
+/// Draw a number 1-25 (one or two digits) centered at (cx, cy).
+fn draw_number(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, n: u32, color: u32) {
+    if n < 10 {
+        draw_digit(buf, w, h, cx, cy, n, color);
+    } else {
+        let tens = n / 10;
+        let ones = n % 10;
+        draw_digit(buf, w, h, cx.saturating_sub(20), cy, tens, color);
+        draw_digit(buf, w, h, cx + 20, cy, ones, color);
     }
 }
 
@@ -162,9 +281,19 @@ fn main() {
     let mut gaze_history: Vec<(f64, f64)> = Vec::with_capacity(16);
     const SMOOTHING_WINDOW: usize = 16;
 
-    let targets = calib_points(sw, sh);
-    // 5 clicks per point × 9 = 45 — same as WebGazer's recommended calibration
-    const SAMPLES_PER_POINT: u32 = 5;
+    // 5x5 grid game calibration: 25 cells with random number labels, played 2 rounds.
+    // Round 1: numbers 1..25 in random positions. Round 2: re-shuffle and play again.
+    // Total: 50 samples across 25 unique screen positions.
+    let grid_centers = grid_5x5_centers(sw, sh);
+    let mut number_map = random_number_map();
+    let mut next_number: u32 = 1;
+    let mut grid_calib_done = false;
+    let mut grid_round: u32 = 1;
+    const GRID_ROUNDS: u32 = 2;
+
+    // Old 9-point click flow disabled in favor of 5x5 game
+    let targets: Vec<(f64, f64)> = grid_centers.clone();
+    const SAMPLES_PER_POINT: u32 = 1;
     let mut calib = CalibrationState::new(targets.len(), SAMPLES_PER_POINT);
 
     let mut buf = vec![0u32; sw * sh];
@@ -348,7 +477,13 @@ fn main() {
                     combined.push(head_h);
                     combined.push(head_roll);
                     combined.push(inter_eye);
-                    current_features = Some(combined);
+                    let ear_r = eye_aspect_ratio(&lm, 36);
+                    let ear_l = eye_aspect_ratio(&lm, 42);
+                    if ear_r.min(ear_l) < EAR_BLINK_THRESHOLD {
+                        // Eye closed/blinking — skip this frame
+                    } else {
+                        current_features = Some(combined);
+                    }
                 }
             }
         }
@@ -378,86 +513,115 @@ fn main() {
             }
         }
 
-        // --- Calibration phase ---
-        if calib.phase() == Phase::Calibrating {
-            let calib_idx = calib.current_point();
-            let samples_at_current_point = calib.samples_at_current();
-            let (tx, ty) = targets[calib_idx];
+        // --- Calibration phase: 5x5 number grid game ---
+        if calib.phase() == Phase::Calibrating && !grid_calib_done {
+            let mx = sw as f64 * 0.08;
+            let my = sh as f64 * 0.08;
+            let usable_w = sw as f64 - 2.0 * mx;
+            let usable_h = sh as f64 - 2.0 * my;
+            let cell_w = usable_w / 5.0;
+            let cell_h = usable_h / 5.0;
 
-            // On WHITE background: target darkens with clicks (light red → dark red)
-            let progress = samples_at_current_point as f32 / SAMPLES_PER_POINT as f32;
-            let red = (255.0 - 100.0 * progress) as u32;
-            let green = (150.0 * (1.0 - progress)) as u32;
-            let blue = (150.0 * (1.0 - progress)) as u32;
-            let target_color = (red << 16) | (green << 8) | blue;
+            // Draw all cell borders + numbers (numbers fade as user clicks them)
+            for cell_idx in 0..25 {
+                let row = cell_idx / 5;
+                let col = cell_idx % 5;
+                let cell_x = (mx + cell_w * col as f64) as usize;
+                let cell_y = (my + cell_h * row as f64) as usize;
+                let cw_px = cell_w as usize;
+                let ch_px = cell_h as usize;
 
-            let r = 22 + (progress * 8.0) as usize;
-            draw_filled_circle(&mut buf, sw, sh, tx as usize, ty as usize, r, target_color);
-            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 3, 0x000000);
-            draw_ring(&mut buf, sw, sh, tx as usize, ty as usize, r + 4, 0x000000);
+                // Cell border (dark gray on white)
+                draw_rect(&mut buf, sw, sh, cell_x, cell_y, cw_px, ch_px, 0xCCCCCC);
 
-            // Capture on mouse click anywhere on/near the target dot
-            // (large hit radius — user just needs to click the area while looking at it)
-            let click_dist = ((mouse_pos.0 as f64 - tx).powi(2) + (mouse_pos.1 as f64 - ty).powi(2)).sqrt();
-            let click_on_target = click_dist < 80.0;
-            if mouse_edge && click_on_target {
-                let has_features = current_features.is_some();
-                let result = calib.handle_capture(has_features);
-                match result {
-                    EventResult::SampleCaptured { point, sample } => {
-                        if let Some(feats) = &current_features {
-                            ridge_reg.add_sample(feats.clone(), tx as f32, ty as f32);
-                            session.calibration.push(CalibFrame {
-                                features: feats.clone(),
-                                target_x: tx as f32,
-                                target_y: ty as f32,
-                            });
+                let n = number_map[cell_idx];
+                let color = if n < next_number {
+                    0xCCCCCC // already clicked, faded
+                } else if n == next_number {
+                    0xCC0000 // current target — red, prominent
+                } else {
+                    0x444444 // dark gray
+                };
+
+                let cx = cell_x + cw_px / 2;
+                let cy = cell_y + ch_px / 2;
+
+                // Highlight current target cell with light background
+                if n == next_number {
+                    for y in 0..ch_px {
+                        for x in 0..cw_px {
+                            if cell_x + x < sw && cell_y + y < sh {
+                                buf[(cell_y + y) * sw + cell_x + x] = 0xFFEEEE;
+                            }
                         }
-                        println!("  Point {}/{} sample {}/{}", point + 1, targets.len(), sample, SAMPLES_PER_POINT);
                     }
-                    EventResult::NextPoint { point } => {
-                        if let Some(feats) = &current_features {
-                            ridge_reg.add_sample(feats.clone(), tx as f32, ty as f32);
-                            session.calibration.push(CalibFrame {
-                                features: feats.clone(),
-                                target_x: tx as f32,
-                                target_y: ty as f32,
-                            });
-                        }
-                        println!("  Point {} complete, next: {}/{}", calib_idx + 1, point + 1, targets.len());
-                    }
-                    EventResult::CalibrationComplete => {
-                        if let Some(feats) = &current_features {
-                            ridge_reg.add_sample(feats.clone(), tx as f32, ty as f32);
-                            session.calibration.push(CalibFrame {
-                                features: feats.clone(),
-                                target_x: tx as f32,
-                                target_y: ty as f32,
-                            });
-                        }
-                        // Auto-tune lambda via leave-one-out cross-validation
-                        let candidates = [1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
-                        if let Some(best_lam) = ridge_reg.auto_lambda(&candidates) {
-                            let loo_err = ridge_reg.loo_error(best_lam);
-                            ridge_reg.set_lambda(best_lam);
-                            println!("\nCalibration done: {} samples. Auto λ={best_lam:.0e} (LOO err: {loo_err:.0} px)",
-                                ridge_reg.sample_count());
-                        } else {
-                            println!("\nCalibration done: {} samples.", ridge_reg.sample_count());
-                        }
-                        println!("Now click each blue dot.");
-                        validation_idx = 0;
-                        validation_results.clear();
-                        gaze_history.clear();
-                        one_euro.reset();
-                    }
-                    EventResult::Rejected => {
-                        println!("  Capture rejected (no face detected — move into camera view)");
-                    }
-                    EventResult::Restarted => {}
+                    // Re-draw border
+                    draw_rect(&mut buf, sw, sh, cell_x, cell_y, cw_px, ch_px, 0xCC0000);
                 }
-            } else if mouse_edge {
-                println!("  Click was {:.0}px away from target — click closer to the red dot", click_dist);
+
+                draw_number(&mut buf, sw, sh, cx, cy, n, color);
+            }
+
+            // Instructions at top
+            // Just leave them in stdout — drawing text is hard
+            // (The user can see "Find: N" with the highlighted cell)
+
+            // Click handling
+            if mouse_edge {
+                let mx_click = mouse_pos.0 as f64;
+                let my_click = mouse_pos.1 as f64;
+                // Find which cell was clicked
+                let col = ((mx_click - mx) / cell_w).floor() as i32;
+                let row = ((my_click - my) / cell_h).floor() as i32;
+                if col >= 0 && col < 5 && row >= 0 && row < 5 {
+                    let clicked_idx = (row * 5 + col) as usize;
+                    let clicked_n = number_map[clicked_idx];
+                    if clicked_n == next_number {
+                        // Correct! Capture sample at cell center
+                        let cell_cx = mx + cell_w * col as f64 + cell_w / 2.0;
+                        let cell_cy = my + cell_h * row as f64 + cell_h / 2.0;
+                        if let Some(feats) = &current_features {
+                            ridge_reg.add_sample(feats.clone(), cell_cx as f32, cell_cy as f32);
+                            session.calibration.push(CalibFrame {
+                                features: feats.clone(),
+                                target_x: cell_cx as f32,
+                                target_y: cell_cy as f32,
+                            });
+                            println!("  Found {next_number}/25 at cell ({col},{row})");
+                        }
+                        next_number += 1;
+                        if next_number > 25 {
+                            if grid_round < GRID_ROUNDS {
+                                // Start next round with reshuffled numbers
+                                grid_round += 1;
+                                next_number = 1;
+                                number_map = random_number_map();
+                                println!("\nRound {grid_round}/{GRID_ROUNDS} starting...");
+                            } else {
+                                grid_calib_done = true;
+                                // Move state machine to validation phase
+                                while calib.phase() == Phase::Calibrating {
+                                    let _ = calib.handle_capture(true);
+                                }
+                                // Auto-tune lambda
+                                let candidates = [1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
+                                if let Some(best_lam) = ridge_reg.auto_lambda(&candidates) {
+                                    let loo_err = ridge_reg.loo_error(best_lam);
+                                    ridge_reg.set_lambda(best_lam);
+                                    println!("\nGrid calibration done ({} rounds): {} samples. Auto λ={best_lam:.0e} (LOO err: {loo_err:.0} px)",
+                                        GRID_ROUNDS, ridge_reg.sample_count());
+                                }
+                                println!("Now click each blue dot for validation.");
+                                validation_idx = 0;
+                                validation_results.clear();
+                                gaze_history.clear();
+                                one_euro.reset();
+                            }
+                        }
+                    } else {
+                        println!("  Wrong cell (clicked {clicked_n}, expected {next_number})");
+                    }
+                }
             }
         }
 
@@ -736,3 +900,14 @@ fn draw_ring(b:&mut[u32],w:usize,h:usize,cx:usize,cy:usize,r:usize,c:u32){for i 
 fn draw_rect(b:&mut[u32],w:usize,h:usize,x:usize,y:usize,rw:usize,rh:usize,c:u32){for dx in 0..rw{let px=x+dx;if px<w{if y<h{b[y*w+px]=c;}let by=y+rh.saturating_sub(1);if by<h{b[by*w+px]=c;}}}for dy in 0..rh{let py=y+dy;if py<h{if x<w{b[py*w+x]=c;}let bx=x+rw.saturating_sub(1);if bx<w{b[py*w+bx]=c;}}}}
 struct FpsC{t:Instant,count:u64,fps:f64}
 impl FpsC{fn new()->Self{Self{t:Instant::now(),count:0,fps:0.0}}fn tick(&mut self){self.count+=1;let e=self.t.elapsed().as_secs_f64();if e>=1.0{self.fps=self.count as f64/e;self.count=0;self.t=Instant::now();}}fn fps(&self)->f64{self.fps}}
+
+/// Eye Aspect Ratio for blink detection (Soukupová & Čech 2016).
+/// EAR = (||p1-p5|| + ||p2-p4||) / (2 * ||p0-p3||)
+/// Open eye: ~0.25-0.30. Closed: <0.15.
+fn eye_aspect_ratio(lm: &[(f32, f32)], start: usize) -> f32 {
+    let d = |a: (f32,f32), b: (f32,f32)| ((a.0-b.0).powi(2)+(a.1-b.1).powi(2)).sqrt();
+    let v1 = d(lm[start+1], lm[start+5]);
+    let v2 = d(lm[start+2], lm[start+4]);
+    let h  = d(lm[start],   lm[start+3]);
+    (v1 + v2) / (2.0 * h.max(1.0))
+}
