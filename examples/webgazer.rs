@@ -27,6 +27,7 @@ use saccade::ridge::{self, RidgeRegressor, RidgeSample, BOTH_EYES_FEAT_LEN};
 const HEAD_POSE_FEAT_LEN: usize = 6;
 const TOTAL_FEAT_LEN: usize = BOTH_EYES_FEAT_LEN + HEAD_POSE_FEAT_LEN; // 126
 const EAR_BLINK_THRESHOLD: f32 = 0.15;
+const CALIB_SAVE_PATH: &str = "saccade_calib.bin";
 use saccade::session::{CalibFrame, Session, ValidFrame};
 use std::time::Instant;
 use tract_onnx::prelude::*;
@@ -294,6 +295,21 @@ fn main() {
         TOTAL_FEAT_LEN,
     );
 
+    // Load saved calibration from previous session
+    let prior = load_calibration(CALIB_SAVE_PATH, TOTAL_FEAT_LEN);
+    if !prior.is_empty() {
+        println!("Loaded {} calibration samples from {CALIB_SAVE_PATH}", prior.len());
+        for s in prior {
+            ridge_reg.add_sample(s.features, s.target_x, s.target_y);
+        }
+        // Auto-tune lambda on loaded data
+        let candidates = [1e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6];
+        if let Some(best_lam) = ridge_reg.auto_lambda(&candidates) {
+            ridge_reg.set_lambda(best_lam);
+            println!("Auto λ={best_lam:.0e} on prior samples.");
+        }
+    }
+
     // Heavy smoothing: 16-point moving average + 1€ filter
     // (offline benchmark showed this is the sweet spot for our setup)
     let mut one_euro = OneEuroFilter2D::new(1.0, 0.05, 1.0);
@@ -371,6 +387,7 @@ fn main() {
         if c_pressed {
             calib.restart();
             ridge_reg.clear();
+            let _ = std::fs::remove_file(CALIB_SAVE_PATH); // invalidate stale saved calibration
             gaze_history.clear();
             one_euro.reset();
             println!("\nCalibration restarted.");
@@ -844,6 +861,9 @@ fn main() {
                 }
 
                 calib.finish_validation();
+                // Persist calibration for next session
+                save_calibration(&ridge_reg.samples, CALIB_SAVE_PATH);
+                println!("Calibration saved ({} samples) → {CALIB_SAVE_PATH}", ridge_reg.samples.len());
             }
         }
 
@@ -962,6 +982,50 @@ fn draw_ring(b:&mut[u32],w:usize,h:usize,cx:usize,cy:usize,r:usize,c:u32){for i 
 fn draw_rect(b:&mut[u32],w:usize,h:usize,x:usize,y:usize,rw:usize,rh:usize,c:u32){for dx in 0..rw{let px=x+dx;if px<w{if y<h{b[y*w+px]=c;}let by=y+rh.saturating_sub(1);if by<h{b[by*w+px]=c;}}}for dy in 0..rh{let py=y+dy;if py<h{if x<w{b[py*w+x]=c;}let bx=x+rw.saturating_sub(1);if bx<w{b[py*w+bx]=c;}}}}
 struct FpsC{t:Instant,count:u64,fps:f64}
 impl FpsC{fn new()->Self{Self{t:Instant::now(),count:0,fps:0.0}}fn tick(&mut self){self.count+=1;let e=self.t.elapsed().as_secs_f64();if e>=1.0{self.fps=self.count as f64/e;self.count=0;self.t=Instant::now();}}fn fps(&self)->f64{self.fps}}
+
+/// Save ridge samples to a simple binary file.
+/// Format: [n: u32][feat_len: u32] then n × [features: feat_len×f32, tx: f32, ty: f32]
+fn save_calibration(samples: &[saccade::ridge::RidgeSample], path: &str) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::File::create(path) else { return };
+    let n = samples.len() as u32;
+    let feat_len = samples.first().map(|s| s.features.len()).unwrap_or(0) as u32;
+    let _ = f.write_all(&n.to_le_bytes());
+    let _ = f.write_all(&feat_len.to_le_bytes());
+    for s in samples {
+        for &v in &s.features {
+            let _ = f.write_all(&v.to_le_bytes());
+        }
+        let _ = f.write_all(&s.target_x.to_le_bytes());
+        let _ = f.write_all(&s.target_y.to_le_bytes());
+    }
+}
+
+/// Load ridge samples from binary file. Returns empty vec on any error.
+fn load_calibration(path: &str, expected_feat_len: usize) -> Vec<saccade::ridge::RidgeSample> {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return vec![] };
+    let mut buf4 = [0u8; 4];
+    if f.read_exact(&mut buf4).is_err() { return vec![]; }
+    let n = u32::from_le_bytes(buf4) as usize;
+    if f.read_exact(&mut buf4).is_err() { return vec![]; }
+    let feat_len = u32::from_le_bytes(buf4) as usize;
+    if feat_len != expected_feat_len || n > 2000 { return vec![]; }
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut features = vec![0.0f32; feat_len];
+        for v in features.iter_mut() {
+            if f.read_exact(&mut buf4).is_err() { return samples; }
+            *v = f32::from_le_bytes(buf4);
+        }
+        if f.read_exact(&mut buf4).is_err() { return samples; }
+        let target_x = f32::from_le_bytes(buf4);
+        if f.read_exact(&mut buf4).is_err() { return samples; }
+        let target_y = f32::from_le_bytes(buf4);
+        samples.push(saccade::ridge::RidgeSample { features, target_x, target_y });
+    }
+    samples
+}
 
 /// Eye Aspect Ratio for blink detection (Soukupová & Čech 2016).
 /// EAR = (||p1-p5|| + ||p2-p4||) / (2 * ||p0-p3||)
