@@ -342,6 +342,16 @@ fn main() {
     let mut pursuit_start_ms: u64 = 0;
     let pursuit_duration_ms: u64 = 18_000;
 
+    // Free-gaze validation (passive, no clicks required)
+    let mut free_gaze_active = false;
+    let mut free_gaze_idx = 0usize;
+    let mut free_gaze_dot_start_ms = 0u64;
+    const FREE_GAZE_DWELL_MS: u64 = 3000; // 3s per target
+    const FREE_GAZE_STABLE_START_MS: u64 = 1000; // collect predictions from 1s in
+    const FREE_GAZE_STABLE_END_MS: u64 = 2500;   // to 2.5s in
+    let mut free_gaze_preds: Vec<(f64, f64)> = Vec::new();
+    let mut free_gaze_results: Vec<(f64, f64, f64, f64)> = Vec::new();
+
     // Multi-point validation: 5 different targets, click each one,
     // we measure error vs prediction for each
     let validation_targets: Vec<(f64, f64)> = vec![
@@ -864,6 +874,82 @@ fn main() {
                 // Persist calibration for next session
                 save_calibration(&ridge_reg.samples, CALIB_SAVE_PATH);
                 println!("Calibration saved ({} samples) → {CALIB_SAVE_PATH}", ridge_reg.samples.len());
+                // Trigger free-gaze passive validation
+                free_gaze_active = true;
+                free_gaze_idx = 0;
+                free_gaze_dot_start_ms = now_ms;
+                free_gaze_preds.clear();
+                free_gaze_results.clear();
+                println!("\nFree-gaze validation starting. Follow the dot with your eyes (no clicking).");
+            }
+        }
+
+        // --- Free-gaze validation: passive (no click), dot auto-advances ---
+        if free_gaze_active && free_gaze_idx < validation_targets.len() {
+            let (vtx, vty) = validation_targets[free_gaze_idx];
+            let elapsed = now_ms.saturating_sub(free_gaze_dot_start_ms);
+            let progress = (elapsed as f64 / FREE_GAZE_DWELL_MS as f64).min(1.0);
+
+            // Draw pulsing orange dot
+            let pulse = ((elapsed as f64 / 200.0).sin() * 0.3 + 0.7) as f32;
+            let r = (20.0 * pulse) as usize;
+            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, r, 0xFF6600);
+            draw_ring(&mut buf, sw, sh, vtx as usize, vty as usize, 32, 0x000000);
+            draw_filled_circle(&mut buf, sw, sh, vtx as usize, vty as usize, 3, 0xFFFFFF);
+
+            // Progress bar
+            let bar_w = (sw as f64 * 0.3) as usize;
+            let bar_x = (sw - bar_w) / 2;
+            let bar_y = sh - 40;
+            for x in 0..bar_w { for y in 0..6 { if bar_y+y < sh { buf[(bar_y+y)*sw+bar_x+x] = 0xCCCCCC; }}}
+            let filled = (bar_w as f64 * progress) as usize;
+            for x in 0..filled { for y in 0..6 { if bar_y+y < sh { buf[(bar_y+y)*sw+bar_x+x] = 0xFF6600; }}}
+
+            // Collect predictions during stable window (1s–2.5s)
+            if elapsed >= FREE_GAZE_STABLE_START_MS && elapsed < FREE_GAZE_STABLE_END_MS {
+                if let Some(feats) = &current_features {
+                    if let Some((raw_x, raw_y)) = ridge_reg.predict(feats) {
+                        let px = (raw_x as f64).clamp(0.0, sw as f64 - 1.0);
+                        let py = (raw_y as f64).clamp(0.0, sh as f64 - 1.0);
+                        free_gaze_preds.push((px, py));
+                    }
+                }
+            }
+
+            // Advance to next target
+            if elapsed >= FREE_GAZE_DWELL_MS {
+                if !free_gaze_preds.is_empty() {
+                    // Use median prediction (more robust than mean)
+                    let mut xs: Vec<f64> = free_gaze_preds.iter().map(|p| p.0).collect();
+                    let mut ys: Vec<f64> = free_gaze_preds.iter().map(|p| p.1).collect();
+                    xs.sort_by(|a,b| a.partial_cmp(b).unwrap());
+                    ys.sort_by(|a,b| a.partial_cmp(b).unwrap());
+                    let med_x = xs[xs.len()/2];
+                    let med_y = ys[ys.len()/2];
+                    let err = ((med_x - vtx).powi(2) + (med_y - vty).powi(2)).sqrt();
+                    println!("  Free-gaze {}/{}: median ({med_x:.0},{med_y:.0}) target ({vtx:.0},{vty:.0}) err {err:.0}px ({} frames)",
+                        free_gaze_idx+1, validation_targets.len(), free_gaze_preds.len());
+                    free_gaze_results.push((med_x, med_y, vtx, vty));
+                }
+                free_gaze_preds.clear();
+                free_gaze_idx += 1;
+                free_gaze_dot_start_ms = now_ms;
+            }
+
+            // All targets done
+            if free_gaze_idx >= validation_targets.len() {
+                free_gaze_active = false;
+                if !free_gaze_results.is_empty() {
+                    let errors: Vec<f64> = free_gaze_results.iter()
+                        .map(|(px,py,tx,ty)| ((px-tx).powi(2)+(py-ty).powi(2)).sqrt())
+                        .collect();
+                    let mean_e = errors.iter().sum::<f64>() / errors.len() as f64;
+                    let max_e  = errors.iter().cloned().fold(0.0f64, f64::max);
+                    println!("\n=== Free-gaze validation (no click) ===");
+                    println!("  Mean error:   {mean_e:.0} px ({:.1}°)", mean_e / 64.0);
+                    println!("  Max error:    {max_e:.0} px");
+                    println!("  (Click-based was reported above for comparison)");
+                }
             }
         }
 
