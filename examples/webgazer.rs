@@ -256,7 +256,7 @@ fn main() {
     // Warm up camera (let AE settle) then lock exposure to prevent drift
     // between calibration and gaze prediction.
     {
-        use nokhwa::utils::{ControlValueSetter, KnownCameraControl};
+        use nokhwa::utils::KnownCameraControl;
         for _ in 0..10 {
             let _ = camera.frame();
         }
@@ -688,7 +688,7 @@ fn main() {
                                         let threshold = mean_r + 2.0 * std_r;
                                         let before = ridge_reg.sample_count();
                                         let good: Vec<RidgeSample> = ridge_reg.samples.iter().zip(residuals.iter())
-                                            .filter(|(_, &r)| r <= threshold)
+                                            .filter(|&(_, r)| *r <= threshold)
                                             .map(|(s, _)| s.clone())
                                             .collect();
                                         let removed = before - good.len();
