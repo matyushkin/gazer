@@ -245,6 +245,25 @@ fn main() {
     };
     camera.open_stream().expect("stream");
 
+    // Warm up camera (let AE settle) then lock exposure to prevent drift
+    // between calibration and gaze prediction.
+    {
+        use nokhwa::utils::{ControlValueSetter, KnownCameraControl};
+        for _ in 0..10 {
+            let _ = camera.frame();
+        }
+        match camera.camera_control(KnownCameraControl::Exposure) {
+            Ok(ctrl) => {
+                let setter = ctrl.value();
+                match camera.set_camera_control(KnownCameraControl::Exposure, setter) {
+                    Ok(_) => println!("Camera exposure locked."),
+                    Err(e) => println!("Note: couldn't lock exposure ({e}), continuing."),
+                }
+            }
+            Err(e) => println!("Note: exposure control not available ({e})."),
+        }
+    }
+
     let cam_res = camera.resolution();
     // Process at modest resolution for high FPS (rustface is the bottleneck)
     let sd = (cam_res.width() / 480).max(1) as usize;
