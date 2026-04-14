@@ -1,0 +1,15 @@
+{"exp":"E12","tool":"replay","metric":"live_px","mean_px":237,"median_px":159,"n_calib":50,"note":"honest multi-point, 5 diverse targets, offline replay","date":"2026-04-14"}
+{"exp":"E13","tool":"mpii_bench","metric":"mpii_deg","mean_deg":5.89,"median_deg":4.52,"std_deg":5.08,"patch":"20x12","feat_dim":483,"n_calib":200,"n_subjects":15,"n_test":210658,"date":"2026-04-14"}
+{"exp":"E14","tool":"mpii_ablation.py","metric":"mpii_deg","mode":"pixel_sm","mean_deg":12.37,"std_deg":5.80,"patch":"10x6","feat_dim":120,"n_calib":200,"n_subjects":5,"stride":10,"date":"2026-04-14"}
+{"exp":"E14","tool":"mpii_ablation.py","metric":"mpii_deg","mode":"pixel_lg","mean_deg":10.35,"std_deg":4.47,"patch":"20x12","feat_dim":480,"n_calib":200,"n_subjects":5,"stride":10,"date":"2026-04-14"}
+{"exp":"E14","tool":"mpii_ablation.py","metric":"mpii_deg","mode":"cnn_only","mean_deg":15.98,"std_deg":3.44,"patch":null,"feat_dim":2,"n_calib":200,"n_subjects":5,"stride":10,"note":"MobileGaze without Sugano norm — worse than pixels","date":"2026-04-14"}
+{"exp":"E14","tool":"mpii_ablation.py","metric":"mpii_deg","mode":"hybrid","mean_deg":11.43,"std_deg":4.73,"patch":"10x6","feat_dim":122,"n_calib":200,"n_subjects":5,"stride":10,"date":"2026-04-14"}
+{"exp":"E14","tool":"mpii_ablation.py","metric":"mpii_deg","mode":"hybrid_lg","mean_deg":10.37,"std_deg":4.49,"patch":"20x12","feat_dim":482,"n_calib":200,"n_subjects":5,"stride":10,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"10x6","feat_dim":123,"n_calib":200,"mean_deg":6.82,"std_deg":5.31,"n_subjects":15,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"20x12","feat_dim":483,"n_calib":200,"mean_deg":5.89,"std_deg":5.08,"n_subjects":15,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"30x18","feat_dim":1083,"n_calib":200,"mean_deg":5.91,"std_deg":5.45,"n_subjects":15,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"36x21","feat_dim":1515,"n_calib":200,"mean_deg":6.02,"std_deg":5.62,"n_subjects":15,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"40x24","feat_dim":1923,"n_calib":200,"mean_deg":5.86,"std_deg":5.37,"n_subjects":15,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"20x12","feat_dim":483,"n_calib":50,"mean_deg":6.63,"std_deg":4.44,"n_subjects":15,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"20x12","feat_dim":483,"n_calib":100,"mean_deg":6.30,"std_deg":5.23,"n_subjects":15,"date":"2026-04-14"}
+{"exp":"E15","tool":"mpii_bench","metric":"mpii_deg","patch":"20x12","feat_dim":483,"n_calib":500,"mean_deg":5.31,"std_deg":4.46,"n_subjects":15,"date":"2026-04-14"}

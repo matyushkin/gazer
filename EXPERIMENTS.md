@@ -25,7 +25,7 @@ pixels). Screen: 2056×1329, viewing distance ~50 cm, 1° ≈ 64 px.
 
 ## Experiments — chronological
 
-### E1. Pixel ridge regression (WebGazer port) — **OUR BEST**
+### E1. Pixel ridge regression (WebGazer port) — status: ACTIVE_BEST (237 px honest, E12)
 
 **Approach:** WebGazer.js direct port. Extract 10×6 grayscale eye patches per eye
 (histogram-equalized), concatenate to 120-D feature vector. Ridge regression to
@@ -53,7 +53,7 @@ calibration and use destroys accuracy.
 
 ---
 
-### E2. Pixel ridge + head pose features
+### E2. Pixel ridge + head pose features — status: FAILED (256 px, features washed out by λ)
 
 **Approach:** Same as E1, plus 6 head pose features (face_x, face_y, face_w,
 face_h, head_roll, inter_eye_distance) appended to the 120-D vector.
@@ -70,7 +70,7 @@ geometry needed for compensation.
 
 ---
 
-### E3. CNN MobileGaze + linear mapper
+### E3. CNN MobileGaze + linear mapper — status: FAILED (299 px, mapper too simple)
 
 **Approach:** Use pretrained MobileGaze ONNX (4.7 MB, MobileOne-S0 backbone) to
 predict (yaw, pitch) angles from face crop. Fit linear `screen = A·(yaw,pitch) + b`
@@ -86,7 +86,7 @@ the full pitch/yaw → screen relationship.
 
 ---
 
-### E4. CNN MobileGaze + 11-feature polynomial (head pose)
+### E4. CNN MobileGaze + 11-feature polynomial (head pose) — status: FAILED (383 px, overfitting)
 
 **Approach:** Polynomial mapper with `[1, yaw, pitch, hx, hy, hw, hr, yaw², pitch², yaw·pitch, hw·yaw]` features. 11 parameters.
 
@@ -97,7 +97,7 @@ was 361 px. Auto-lambda picked 1.0 which was too small.
 
 ---
 
-### E5. CNN MobileGaze + 6-feature polynomial (yaw/pitch only)
+### E5. CNN MobileGaze + 6-feature polynomial (yaw/pitch only) — status: FAILED (not robustly tested, ~E3 level)
 
 **Approach:** Standard literature recipe — degree-2 polynomial of (yaw, pitch):
 `[1, yaw, pitch, yaw², pitch², yaw·pitch]`. 45 calibration samples.
@@ -107,7 +107,7 @@ performance as E3-E4.
 
 ---
 
-### E6. CNN ResNet-18 + 6-feature polynomial
+### E6. CNN ResNet-18 + 6-feature polynomial — status: FAILED (397 px, no Sugano norm)
 
 **Approach:** Switched MobileGaze (4.7 MB) → ResNet-18 (43 MB), supposed to be
 slightly more accurate. 45 calibration, 6-feature polynomial.
@@ -120,7 +120,7 @@ normalization, the CNN gives noisy/biased angles.
 
 ---
 
-### E7. CNN ResNet-50 (briefly tested)
+### E7. CNN ResNet-50 (briefly tested) — status: DROPPED (<2 FPS unusable; retry only with GPU)
 
 **Approach:** Largest model, 95 MB, supposedly closest to L2CS-Net 3.92° on
 MPIIFaceGaze.
@@ -130,7 +130,7 @@ the UI unusable. Calibration clicks didn't register reliably.
 
 ---
 
-### E8. CNN + Sugano 2014 normalization (my implementation)
+### E8. CNN + Sugano 2014 normalization — status: BLOCKED (737 px; needs iterative PnP + debug crops + matched CNN params)
 
 **Approach:** Implement Sugano 2014 head-pose normalization:
 1. Solve PnP on 6 PFLD landmarks → 3D head rotation+translation
@@ -159,7 +159,7 @@ A correct Sugano implementation matched to a specific CNN's training would take
 
 ---
 
-### E11. Smooth pursuit calibration phase — **FAILED**
+### E11. Smooth pursuit calibration phase — status: FAILED (329 px vs 142 px; retry only with velocity filtering)
 
 **Approach:** After 9-point click calibration, add an animated trajectory phase
 where a dot traces a horizontal+vertical meander pattern over 18 seconds.
@@ -189,7 +189,7 @@ This is the literature recipe (Pursuits, Vidal et al. 2013).
 
 ---
 
-### E10. White background lighting hack — **BIG WIN**
+### E10. White background lighting hack — status: SHIPPED (161→142 px, -12%; always on)
 
 **Approach:** Clear screen buffer to white (0xFFFFFF) instead of black during
 calibration/validation/running. The screen acts as a fill light, illuminating
@@ -214,7 +214,7 @@ median **190 → 151 px** (-21%), FPS **9 → 10-11**. All errors <200 px.
 
 ---
 
-### E9. PPERV (head-pose-invariant pupil position)
+### E9. PPERV (head-pose-invariant pupil position) — status: DEPRECATED (pre-WebGazer port, never validated)
 
 **Approach (deprecated):** Compute pupil position relative to eye corners,
 de-rotated by eye axis angle. Used in our original `webcam.rs` example before
@@ -295,7 +295,7 @@ geometric approach.
 
 ---
 
-### E12. Offline replay benchmark — decay weights, residual filtering, CLAHE
+### E12. Offline replay benchmark — status: DONE (honest baseline: 237 px multi-point)
 
 **Date:** 2026-04-14
 
@@ -347,7 +347,7 @@ at diverse screen positions (20/80% corners + center). Screen 2056×1329.
 
 ---
 
-### E13. MPIIGaze dataset benchmark — angular error in normalized space
+### E13. MPIIGaze dataset benchmark — status: DONE (5.89°/4.52° median, competitive with L2CS-Net)
 
 **Date:** 2026-04-14
 
@@ -412,7 +412,7 @@ features is competitive with large cross-subject DNNs.
 
 ---
 
-### E14. MPIIGaze ablation: resolution, CNN hybrid (Python)
+### E14. MPIIGaze ablation: resolution, CNN hybrid — status: DONE (20×12 optimal; CNN without Sugano useless)
 
 **Date:** 2026-04-14
 
@@ -454,7 +454,7 @@ to MobileGaze training parameters. See Option A in path forward.
 
 ---
 
-### E15. Resolution + calibration ablation on Rust benchmark (Normalized data)
+### E15. Resolution + calibration ablation on Rust benchmark — status: DONE (plateau at 20×12; n=500 → 5.31°)
 
 **Date:** 2026-04-14
 
