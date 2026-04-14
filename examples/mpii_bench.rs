@@ -66,6 +66,9 @@ fn main() {
     let mut flip_right = false;
     let mut use_gradient = false;
     let mut uniform_calib = false;
+    let mut clahe_tx: usize = 2;
+    let mut clahe_ty: usize = 2;
+    let mut clahe_clip: f32 = 4.0;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -78,6 +81,15 @@ fn main() {
             }
             "--n-calib" => {
                 n_calib = args.next().expect("--n-calib N").parse().expect("N");
+            }
+            "--clahe-tiles" => {
+                let v = args.next().expect("--clahe-tiles TxT");
+                let parts: Vec<&str> = v.split('x').collect();
+                clahe_tx = parts[0].parse().expect("tiles X");
+                clahe_ty = parts[1].parse().expect("tiles Y");
+            }
+            "--clahe-clip" => {
+                clahe_clip = args.next().expect("--clahe-clip C").parse().expect("C");
             }
             "--flip-right"    => flip_right = true,
             "--gradient"      => use_gradient = true,
@@ -94,9 +106,10 @@ fn main() {
     let feat_desc = if use_gradient { "CLAHE+SobelX" } else { "CLAHE" };
     let flip_desc = if flip_right { ", right-eye flipped" } else { "" };
     let calib_desc = if uniform_calib { "uniform" } else { "first" };
+    let clahe_desc = format!("tiles={clahe_tx}×{clahe_ty} clip={clahe_clip}");
     println!("MPIIGaze benchmark — preprocessed root: {proc_root}");
     println!("Protocol: {calib_desc} {n_calib} frames/subject = calibration, rest = test");
-    println!("Features: {feat_len}-D ({feat_desc} {patch_w}×{patch_h} eye patches + 3 head-pose{flip_desc})");
+    println!("Features: {feat_len}-D ({feat_desc} {patch_w}×{patch_h} [{clahe_desc}] eye patches + 3 head-pose{flip_desc})");
     println!();
 
     let mut all_errors: Vec<f64> = Vec::new();
@@ -125,7 +138,7 @@ fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         let extracted: Vec<Option<(Vec<f32>, f64, f64)>> = samples.iter()
-            .map(|s| extract_features(s, patch_w, patch_h, flip_right, use_gradient))
+            .map(|s| extract_features(s, patch_w, patch_h, flip_right, use_gradient, clahe_tx, clahe_ty, clahe_clip))
             .collect();
 
         // Select calibration indices (first N, or uniformly spread across session)
@@ -313,6 +326,9 @@ fn extract_features(
     patch_h: usize,
     flip_right: bool,
     use_gradient: bool,
+    clahe_tx: usize,
+    clahe_ty: usize,
+    clahe_clip: f32,
 ) -> Option<(Vec<f32>, f64, f64)> {
     let load_gray = |path: &str| -> Option<(Vec<u8>, usize, usize)> {
         let img = ImageReader::open(path).ok()?.decode().ok()?.into_luma8();
@@ -329,8 +345,8 @@ fn extract_features(
     };
 
     // Patches are single-channel (grayscale PNG from preprocessor)
-    let l_feat = ridge::extract_eye_features_gray_sized(&left_gray,  lw, lh, patch_w, patch_h);
-    let r_feat = ridge::extract_eye_features_gray_sized(&right_gray, rw, rh, patch_w, patch_h);
+    let l_feat = ridge::extract_eye_features_gray_sized_clahe(&left_gray,  lw, lh, patch_w, patch_h, clahe_tx, clahe_ty, clahe_clip);
+    let r_feat = ridge::extract_eye_features_gray_sized_clahe(&right_gray, rw, rh, patch_w, patch_h, clahe_tx, clahe_ty, clahe_clip);
 
     // Optionally append Sobel-x gradient features (same spatial layout as pixels)
     let l_feat = if use_gradient {

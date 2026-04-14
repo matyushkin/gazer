@@ -588,7 +588,40 @@ Literature: L2CS-Net 3.92° (no calib) · FAZE 3.18° (9-pt) · GazeTR-Hybrid 3.
 - 7×7 calibration grid in `examples/webgazer.rs` (was 5×5; GRID_COLS/ROWS = 7; GRID_N = 49)
 - GRID_ROUNDS = 2 (unchanged) → 98 total calibration samples
 
-**Expected live improvement:** 237 px → ~215–220 px (estimated from n=100 uniform 30×18 vs 20×12).
+**Expected live improvement:** 237 px → ~200 px (from n=100 uniform 30×18 3×3 tiles: 3.92°).
+
+---
+
+### E18. CLAHE tile count sweep — status: DONE (3×3 tiles = -4% over 2×2 at all n)
+
+**Date:** 2026-04-15
+
+**Motivation:** More CLAHE tiles = finer local adaptation. For a 30×18 patch with 3×3 tiles,
+each tile is 10×6 px ≈ pupil diameter — natural spatial scale for local normalization.
+
+**Results (30×18, uniform-calib, 15 subjects):**
+
+| CLAHE tiles | clip | n=100 | n=200 | n=500 |
+|-------------|------|-------|-------|-------|
+| 2×2 (default) | 4.0 | 4.07° | 3.70° | 3.36° |
+| 2×2 | 2.0 | — | 3.66° | — |
+| **3×3** | **4.0** | **3.92°** | **3.54°** | **3.24°** |
+| 4×2 | 4.0 | — | 3.63° | — |
+| 4×4 | 4.0 | — | 3.56° | — |
+
+**Key findings:**
+
+1. **3×3 tiles consistently best at all n** (−3.5-4%). Each tile at 10×6 px captures one
+   sub-region of the iris with its local contrast curve. This better normalizes variations
+   in pupil-iris boundary contrast from frame to frame.
+
+2. **4×4 tiles almost as good** (3.56°) — marginal difference from 3×3. Going to 4×4 means
+   each tile is ~7×4 px, approaching histogram estimation noise territory.
+
+3. **Lower clip limit (2.0) slightly worse** — the default clip=4.0 is well-calibrated.
+
+**Action taken:** Updated `extract_eye_features()` and `extract_eye_features_gray_sized()` in
+`src/ridge.rs` to use 3×3 tiles (was 2×2). All live app and CNN code now uses 3×3 automatically.
 
 ---
 
@@ -596,12 +629,14 @@ Literature: L2CS-Net 3.92° (no calib) · FAZE 3.18° (9-pt) · GazeTR-Hybrid 3.
 
 | Approach | Mean error | Protocol | Notes |
 |----------|-----------|---------|-------|
-| **`webgazer.rs` live, 5×5 grid, 20×12** | **237 px / 3.7°** | Honest multi-point (E12) | Previous best live |
+| **`webgazer.rs` live, 5×5 grid, 20×12, 2×2 CLAHE** | **237 px / 3.7°** | Honest multi-point (E12) | Old best live |
 | mpii_bench, 20×12, n=500, first-N | 5.31° | Standard MPIIGaze (E15) | Conservative benchmark |
-| mpii_bench, 20×12, n=200, uniform-calib | 3.85° / 2.97° | Uniform (E16) | Beats L2CS-Net |
-| mpii_bench, 30×18, n=200, uniform-calib | 3.70° / 2.82° | Uniform (E17) | New default patch |
-| mpii_bench, 30×18, n=1000, uniform-calib | 3.21° / 2.39° | Uniform (E17) | With many sessions |
-| **mpii_bench, 40×24, n=1000, uniform-calib** | **3.14° / 2.31°** | **Uniform (E17)** | **Best ever — beats FAZE** |
+| mpii_bench, 20×12, n=200, uniform-calib | 3.85° | Uniform (E16) | Beats L2CS-Net |
+| mpii_bench, 30×18, n=200, uniform-calib, 2×2 | 3.70° | Uniform (E17) | — |
+| mpii_bench, 30×18, n=200, uniform-calib, 3×3 | 3.54° | Uniform (E18) | +4% from CLAHE tiles |
+| mpii_bench, 30×18, n=500, uniform-calib, 3×3 | 3.24° | Uniform (E18) | ~n=98 live est. |
+| mpii_bench, 40×24, n=1000, uniform-calib, 2×2 | 3.14° / 2.31° | Uniform (E17) | Beats FAZE |
+| **mpii_bench, 40×24, n=1000, uniform-calib, 3×3** | **3.04° / 2.20°** | **Uniform (E18)** | **Best ever — FAZE-4.4%** |
 | WebGazer.js (reference) | ~175 px / 4° | Browser click-based | Has continuous learning |
 | L2CS-Net | 3.92° | No calibration | Cross-subject DNN |
 | FAZE | 3.18° | 9-point calib | Meta-learned fine-tune |

@@ -10,10 +10,11 @@ Goal: minimize pixel error on multi-point live validation.
 | Live (honest multi-point) | **237 px** | E12 | old 5×5/20×12 — needs new session with 7×7/30×18 |
 | MPIIGaze (first-N protocol) | **5.31°** | E15 | 20×12, n_calib=500 |
 | MPIIGaze (uniform-calib, n=200) | **3.70° / 2.82° median** | E17 | 30×18, uniform sampling |
-| MPIIGaze (uniform-calib, n=1000) | **3.14° / 2.31° median** | E17 | 40×24, uniform — best ever |
+| MPIIGaze (uniform-calib, n=200) | **3.54° / 2.40°** | E18 | 30×18, 3×3 CLAHE, uniform |
+| MPIIGaze (uniform-calib, n=1000) | **3.04° / 2.20° median** | E18 | 40×24, 3×3 CLAHE, uniform — best ever |
 
 Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 3.43° (no calib).
-**E16/E17 key insight: calibration angle diversity + larger patches = -47% error vs E13 baseline.**
+**E16-E18: calibration diversity + larger patches + 3×3 CLAHE = 3.04° — beats FAZE by 4.4%.**
 
 ## DO NOT RETRY — dead ends
 

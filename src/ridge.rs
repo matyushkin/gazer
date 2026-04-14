@@ -27,7 +27,7 @@ pub const BOTH_EYES_FEAT_LEN: usize = EYE_FEAT_LEN * 2; // 1080 total
 /// Extract WebGazer-style features from an RGB eye patch.
 /// Returns a 60-element feature vector (10×6 CLAHE-normalized grayscale).
 ///
-/// Pipeline: RGB → grayscale → CLAHE (2×2 tiles, clip=4.0) → resize to 10×6
+/// Pipeline: RGB → grayscale → CLAHE (3×3 tiles, clip=4.0) → resize to EYE_PATCH_W×H
 pub fn extract_eye_features(rgb: &[u8], width: usize, height: usize) -> Vec<f32> {
     if rgb.len() != width * height * 3 || width == 0 || height == 0 {
         return vec![0.0; EYE_FEAT_LEN];
@@ -42,11 +42,12 @@ pub fn extract_eye_features(rgb: &[u8], width: usize, height: usize) -> Vec<f32>
         gray[i] = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
     }
 
-    // Step 2: Apply CLAHE on the full-resolution grayscale patch (2×2 tiles)
-    // This handles uneven lighting across the eye (e.g., screen-side vs dark side)
-    let equalized = clahe_gray(&gray, width, height, 2, 2, 4.0);
+    // Step 2: Apply CLAHE on the full-resolution grayscale patch (3×3 tiles).
+    // 3×3 tiles: each tile ≈ pupil-scale → better local contrast at iris/eyelid boundaries.
+    // E18: 3×3 gives 3.5-4% lower error vs 2×2 across all n_calib and patch sizes.
+    let equalized = clahe_gray(&gray, width, height, 3, 3, 4.0);
 
-    // Step 3: Bilinear resize to 10×6
+    // Step 3: Bilinear resize to EYE_PATCH_W×EYE_PATCH_H
     bilinear_resize_gray_f32(&equalized, width, height, EYE_PATCH_W, EYE_PATCH_H)
 }
 
@@ -64,12 +65,28 @@ pub fn extract_eye_features_gray_sized(
     out_w: usize,
     out_h: usize,
 ) -> Vec<f32> {
+    // 3×3 tiles: each tile ≈ 10×6 px for a 30×18 crop — matches pupil scale.
+    // E18: 3×3 tiles give 3.5-4% lower error vs 2×2 at all n_calib and patch sizes.
+    extract_eye_features_gray_sized_clahe(gray_patch, width, height, out_w, out_h, 3, 3, 4.0)
+}
+
+/// Extract features with configurable CLAHE tile grid and clip limit.
+pub fn extract_eye_features_gray_sized_clahe(
+    gray_patch: &[u8],
+    width: usize,
+    height: usize,
+    out_w: usize,
+    out_h: usize,
+    tiles_x: usize,
+    tiles_y: usize,
+    clip: f32,
+) -> Vec<f32> {
     let out_len = out_w * out_h;
     if gray_patch.len() != width * height || width == 0 || height == 0 {
         return vec![0.0; out_len];
     }
 
-    let equalized = clahe_gray(gray_patch, width, height, 2, 2, 4.0);
+    let equalized = clahe_gray(gray_patch, width, height, tiles_x, tiles_y, clip);
     bilinear_resize_gray_f32(&equalized, width, height, out_w, out_h)
 }
 
