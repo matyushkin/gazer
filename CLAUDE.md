@@ -35,6 +35,8 @@ Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 
 | Wide aspect ratio patches 40×12 (E19) | 3.61° — worse; 30×18 (5:3 ratio) better | — |
 | Multi-scale features 40×24+20×12 (E21) | 3.06° at n=1000 vs 3.04° single-scale — neutral; marginal at n=500 | — |
 | n_calib > 1000 for ridge (E20) | Curve flattening: n=1000→3.04°, n=5000→2.83° — only 0.21° gain for 5× more data | Only if accumulating many sessions passively |
+| Greedy k-center in head pose (E23) | 4.68° at n=200 vs 3.85° uniform — worse; head pose nearly constant in MPIIGaze, not a gaze proxy | — |
+| 4×4 CLAHE tiles on 40×24 (E22) | 3.07° at n=1000 vs 3.04° for 3×3 — same; 3×3 remains optimal | — |
 
 ## Promising next steps (ordered)
 

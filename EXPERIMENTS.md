@@ -688,6 +688,58 @@ extraction time and 25% larger feature vector.
 
 ---
 
+### E22. CLAHE tile count on 40×24 patch — status: DONE (3×3 remains best)
+
+**Date:** 2026-04-15
+
+**Motivation:** For 40×24 patches, 3×3 tiles give 13×8 px/tile. The "pupil scale" argument
+(10×6 px) from E18 suggests 4×4 tiles might be optimal. Test this directly.
+
+**Results (40×24, 3×3 CLAHE, uniform):**
+
+| Tiles | n=200 | n=1000 |
+|-------|-------|--------|
+| 3×3 (13×8 px/tile) | 3.85° | **3.04°** |
+| **4×4 (10×6 px/tile)** | 3.53° | 3.07° |
+
+**Conclusion:** 4×4 on 40×24 is essentially the same as 3×3 at n=1000. The pupil-scale tile
+argument doesn't generalize perfectly — 3×3 tiles remain default. The n=200 gain (3.53° vs
+3.85°) is partially due to tighter local normalization but may come at cost of regularization.
+
+---
+
+### E23. Diversity-based calibration sampling (greedy k-center in head pose) — status: DONE (worse, dead end)
+
+**Date:** 2026-04-15
+
+**Motivation:** If uniform temporal sampling works because it covers diverse gaze angles, could
+we directly maximize gaze diversity? Since gaze labels are unknown at calibration time, use
+head pose (available from PFLD landmarks) as a proxy for gaze direction.
+
+**Implementation:** `--diverse-calib` flag. For each subject: greedy k-center algorithm in 3D
+head pose space (rotation vector). Start at sample closest to mean pose, iteratively add the
+sample furthest from the current selected set. O(n_total × n_calib) complexity.
+
+**Results vs uniform (40×24, 3×3 CLAHE):**
+
+| n_calib | Diverse-headpose | Uniform | Delta |
+|---------|-----------------|---------|-------|
+| 200 | 4.68° / 3.96° med | 3.85° / 2.97° med | **+22% worse** |
+| 1000 | 3.45° / 2.76° med | 3.04° / 2.20° med | **+13% worse** |
+
+**Root cause:** MPIIGaze subjects sit stationary in front of a laptop. Head pose barely changes
+throughout a session — nearly all head rotation vectors cluster tightly. The k-center algorithm
+either picks arbitrary samples (when all distances are equal) or selects extreme head pose
+outliers (e.g., glancing sideways), which are unrepresentative of normal gaze.
+
+Lesson: **gaze diversity ≠ head pose diversity** in a single-session laptop dataset. The uniform
+temporal sampling works because MPIIGaze sessions have natural temporal variation in screen gaze
+that correlates with session position — not because head pose varies.
+
+**Dead end.** Do not retry unless combining with gaze-direction estimates from a rough model.
+
+---
+
 ## Best-of-the-best summary (for moving on or paper writing)
 
 | Approach | Mean error | Protocol | Notes |

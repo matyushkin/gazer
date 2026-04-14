@@ -76,6 +76,8 @@ fn main() {
     let mut fine_lambda = false;
     // multi-scale: concatenate two CLAHE patches per eye (primary patch + half-scale coarse patch)
     let mut multi_scale = false;
+    // diverse-calib: greedily select calibration samples to maximize head-pose space coverage
+    let mut diverse_calib = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -106,6 +108,7 @@ fn main() {
             "--separate-eyes"      => separate_eyes = true,
             "--fine-lambda"        => fine_lambda = true,
             "--multi-scale"        => multi_scale = true,
+            "--diverse-calib"      => diverse_calib = true,
             s if !s.starts_with('-') => proc_root = s.to_string(),
             _ => eprintln!("unknown arg: {arg}"),
         }
@@ -124,7 +127,7 @@ fn main() {
 
     let feat_desc = if use_gradient { "CLAHE+SobelX" } else { "CLAHE" };
     let flip_desc = if flip_right { ", right-eye flipped" } else { "" };
-    let calib_desc = if uniform_calib { "uniform" } else { "first" };
+    let calib_desc = if diverse_calib { "diverse-headpose" } else if uniform_calib { "uniform" } else { "first" };
     let clahe_desc = format!("tiles={clahe_tx}×{clahe_ty} clip={clahe_clip}");
     let scale_desc = if multi_scale { format!("+{coarse_w}×{coarse_h}coarse") } else { String::new() };
     println!("MPIIGaze benchmark — preprocessed root: {proc_root}");
@@ -163,9 +166,54 @@ fn main() {
                                       multi_scale, coarse_w, coarse_h))
             .collect();
 
-        // Select calibration indices (first N, or uniformly spread across session)
+        // Select calibration indices (first N, uniformly spread, or head-pose diverse)
         let n_total = extracted.len();
-        let calib_indices: Vec<usize> = if uniform_calib {
+        let calib_indices: Vec<usize> = if diverse_calib {
+            // Greedy k-center in head pose space: maximize minimum pairwise distance.
+            // Seed with the sample closest to the mean head pose, then greedily add
+            // the sample furthest from the current selected set.
+            let head_poses: Vec<[f32; 3]> = samples.iter().map(|s| s.head).collect();
+            let hp_dist = |a: usize, b: usize| -> f32 {
+                let d = [
+                    head_poses[a][0] - head_poses[b][0],
+                    head_poses[a][1] - head_poses[b][1],
+                    head_poses[a][2] - head_poses[b][2],
+                ];
+                (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]).sqrt()
+            };
+            // Seed: sample closest to mean
+            let mean_hp = {
+                let mut m = [0.0f32; 3];
+                for s in &head_poses { for j in 0..3 { m[j] += s[j]; } }
+                for j in 0..3 { m[j] /= n_total as f32; }
+                m
+            };
+            let seed = (0..n_total).min_by(|&a, &b| {
+                let da = ((head_poses[a][0]-mean_hp[0]).powi(2)+(head_poses[a][1]-mean_hp[1]).powi(2)+(head_poses[a][2]-mean_hp[2]).powi(2)).sqrt();
+                let db = ((head_poses[b][0]-mean_hp[0]).powi(2)+(head_poses[b][1]-mean_hp[1]).powi(2)+(head_poses[b][2]-mean_hp[2]).powi(2)).sqrt();
+                da.partial_cmp(&db).unwrap()
+            }).unwrap_or(0);
+            let mut selected = vec![seed];
+            let mut is_selected = vec![false; n_total];
+            is_selected[seed] = true;
+            // dist_to_set[i] = min distance from sample i to any selected sample
+            let mut dist_to_set: Vec<f32> = (0..n_total).map(|i| hp_dist(i, seed)).collect();
+            dist_to_set[seed] = 0.0;
+            while selected.len() < n_calib.min(n_total) {
+                let next = (0..n_total)
+                    .filter(|&i| !is_selected[i])
+                    .max_by(|&a, &b| dist_to_set[a].partial_cmp(&dist_to_set[b]).unwrap())
+                    .unwrap();
+                is_selected[next] = true;
+                // Update distances
+                for i in 0..n_total {
+                    let d = hp_dist(i, next);
+                    if d < dist_to_set[i] { dist_to_set[i] = d; }
+                }
+                selected.push(next);
+            }
+            selected
+        } else if uniform_calib {
             // Uniformly spread n_calib samples across the full session
             (0..n_calib)
                 .map(|i| i * n_total / n_calib)
