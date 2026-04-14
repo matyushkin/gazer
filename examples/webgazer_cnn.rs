@@ -363,68 +363,45 @@ fn main() {
                     (lm[54].0 as f64, lm[54].1 as f64),
                 ];
 
-                // Solve PnP — focal length ~ image width (approximation for unknown camera)
+                // Build real camera intrinsic matrix (focal = image width approximation)
                 let focal = cw as f64;
+                let cam = sugano::make_intrinsic(focal, focal, cw as f64 / 2.0, ch as f64 / 2.0);
+
                 if let Some((rotation, translation)) =
                     sugano::solve_pnp(&img_pts, focal, cw as f64, ch as f64)
                 {
-                    // Eye center 3D = midpoint of eye corners in camera frame
-                    // Use actual camera-frame eye center (rotated face model + translation)
+                    // Face center in camera frame = mean landmark position
                     let model = sugano::face_model_3d();
-                    let r_eye_3d = rotation * model[0] + translation; // outer right
-                    let l_eye_3d = rotation * model[3] + translation; // outer left
-                    let eye_center_3d = (r_eye_3d + l_eye_3d) * 0.5;
+                    let mut face_center = Vector3::zeros();
+                    for i in 0..6 {
+                        face_center += rotation * model[i] + translation;
+                    }
+                    face_center /= 6.0;
 
                     // Run gaze every 2nd frame on normalized crop
                     let do_gaze = frame_n % 2 == 0 || last_gaze.is_none();
                     if do_gaze {
-                        let normalized = sugano::normalize_eye_crop(
+                        // ETH-XGaze normalization
+                        let (normalized, r_norm) = sugano::normalize_face(
                             &rgb, cw, ch,
-                            eye_center_3d,
-                            rotation,
-                            focal,
-                            448, 448,
-                            600.0,   // virtual distance: 600 mm
-                            1600.0,  // virtual focal length
+                            &cam,
+                            &rotation,
+                            &face_center,
+                            &sugano::FaceNormParams::ETH_XGAZE,
                         );
 
-                        // DEBUG: save first N normalized crops + raw face crop for comparison
+                        // DEBUG: save first N normalized crops
                         if debug_saves_remaining > 0 {
                             let idx = 10 - debug_saves_remaining;
-                            // Save normalized crop
                             if let Some(img) = image::RgbImage::from_raw(448, 448, normalized.clone()) {
                                 let _ = img.save(format!("debug_crops/normalized_{idx:02}.png"));
                             }
-                            // Save raw face crop for comparison
-                            let crop_w = fwf;
-                            let crop_h = fhf;
-                            let mut raw_crop = vec![0u8; crop_w * crop_h * 3];
-                            for y in 0..crop_h {
-                                for x in 0..crop_w {
-                                    if fx + x < cw && fy + y < ch {
-                                        let si = ((fy + y) * cw + (fx + x)) * 3;
-                                        let di = (y * crop_w + x) * 3;
-                                        raw_crop[di] = rgb[si];
-                                        raw_crop[di+1] = rgb[si+1];
-                                        raw_crop[di+2] = rgb[si+2];
-                                    }
-                                }
-                            }
-                            if let Some(img) = image::RgbImage::from_raw(crop_w as u32, crop_h as u32, raw_crop) {
-                                let _ = img.save(format!("debug_crops/raw_face_{idx:02}.png"));
-                            }
-                            // Also dump diagnostic info
-                            println!("[DEBUG] Save {idx:02}: face=({fx},{fy},{fwf},{fhf}) eye_3d=({:.1},{:.1},{:.1}) tz={:.1}",
-                                eye_center_3d.x, eye_center_3d.y, eye_center_3d.z, translation.z);
+                            println!("[DEBUG] Save {idx:02}: face_center=({:.1},{:.1},{:.1})",
+                                face_center.x, face_center.y, face_center.z);
                             debug_saves_remaining -= 1;
-                            if debug_saves_remaining == 0 {
-                                println!("[DEBUG] Finished saving 10 crops to debug_crops/");
-                            }
                         }
 
                         if let Some((yaw_n, pitch_n)) = run_gaze_from_buffer(&gaze_net, &normalized, 448, 448) {
-                            // Denormalize back to real camera frame
-                            let r_norm = build_normalization_rotation(&rotation, &eye_center_3d);
                             let (yaw, pitch) = sugano::denormalize_gaze(yaw_n, pitch_n, &r_norm);
                             last_gaze = Some((yaw, pitch));
                         }
