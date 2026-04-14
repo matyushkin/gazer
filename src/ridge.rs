@@ -501,18 +501,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feature_extraction_returns_60_values() {
-        // 20×12 RGB eye patch
+    fn feature_extraction_returns_correct_len() {
+        // 20×12 RGB eye patch → EYE_FEAT_LEN = 20*12 = 240
         let rgb = vec![128u8; 20 * 12 * 3];
         let feat = extract_eye_features(&rgb, 20, 12);
-        assert_eq!(feat.len(), 60);
+        assert_eq!(feat.len(), EYE_FEAT_LEN);
     }
 
     #[test]
     fn feature_extraction_gray() {
+        // 30×18 grayscale input → resized to EYE_PATCH_W×EYE_PATCH_H = 240-D
         let gray = vec![100u8; 30 * 18];
         let feat = extract_eye_features_gray(&gray, 30, 18);
-        assert_eq!(feat.len(), 60);
+        assert_eq!(feat.len(), EYE_FEAT_LEN);
     }
 
     #[test]
@@ -610,6 +611,6 @@ mod tests {
         // Regression: make sure feature extraction doesn't panic on small inputs
         let rgb = vec![100u8; 8 * 6 * 3];
         let feat = extract_eye_features(&rgb, 8, 6);
-        assert_eq!(feat.len(), 60);
+        assert_eq!(feat.len(), EYE_FEAT_LEN);
     }
 }

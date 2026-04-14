@@ -58,11 +58,14 @@ struct Sample {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Parse args: [proc_root] [--patch WxH] [--n-calib N]
+    // Parse args: [proc_root] [--patch WxH] [--n-calib N] [--flip-right] [--gradient]
     let mut proc_root = "MPIIGaze_proc".to_string();
     let mut patch_w: usize = 20;
     let mut patch_h: usize = 12;
     let mut n_calib: usize = 200;
+    let mut flip_right = false;
+    let mut use_gradient = false;
+    let mut uniform_calib = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -76,16 +79,24 @@ fn main() {
             "--n-calib" => {
                 n_calib = args.next().expect("--n-calib N").parse().expect("N");
             }
+            "--flip-right"    => flip_right = true,
+            "--gradient"      => use_gradient = true,
+            "--uniform-calib" => uniform_calib = true,
             s if !s.starts_with('-') => proc_root = s.to_string(),
             _ => eprintln!("unknown arg: {arg}"),
         }
     }
 
-    let feat_len = patch_w * patch_h * 2 + 3; // two eyes + 3 head pose
+    // Feature length: pixels per eye × 2 eyes (×2 if gradient appended) + 3 head pose
+    let feat_per_eye = patch_w * patch_h * if use_gradient { 2 } else { 1 };
+    let feat_len = feat_per_eye * 2 + 3;
 
+    let feat_desc = if use_gradient { "CLAHE+SobelX" } else { "CLAHE" };
+    let flip_desc = if flip_right { ", right-eye flipped" } else { "" };
+    let calib_desc = if uniform_calib { "uniform" } else { "first" };
     println!("MPIIGaze benchmark — preprocessed root: {proc_root}");
-    println!("Protocol: first {n_calib} frames/subject = calibration, rest = test");
-    println!("Features: {feat_len}-D (CLAHE {patch_w}×{patch_h} eye patches + 3 head-pose)");
+    println!("Protocol: {calib_desc} {n_calib} frames/subject = calibration, rest = test");
+    println!("Features: {feat_len}-D ({feat_desc} {patch_w}×{patch_h} eye patches + 3 head-pose{flip_desc})");
     println!();
 
     let mut all_errors: Vec<f64> = Vec::new();
@@ -114,19 +125,32 @@ fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         let extracted: Vec<Option<(Vec<f32>, f64, f64)>> = samples.iter()
-            .map(|s| extract_features(s, patch_w, patch_h))
+            .map(|s| extract_features(s, patch_w, patch_h, flip_right, use_gradient))
             .collect();
 
-        let calib_count = extracted.iter().take(n_calib)
-            .filter(|e| e.is_some()).count();
+        // Select calibration indices (first N, or uniformly spread across session)
+        let n_total = extracted.len();
+        let calib_indices: Vec<usize> = if uniform_calib {
+            // Uniformly spread n_calib samples across the full session
+            (0..n_calib)
+                .map(|i| i * n_total / n_calib)
+                .collect()
+        } else {
+            (0..n_calib).collect()
+        };
+        let calib_set: std::collections::HashSet<usize> = calib_indices.iter().copied().collect();
+
+        let calib_count = calib_indices.iter()
+            .filter(|&&i| extracted[i].is_some()).count();
 
         let mut reg = RidgeRegressor::new(n_calib + 10, 1e4, feat_len);
 
         // Calibration phase
-        for entry in extracted.iter().take(n_calib).flatten() {
-            let (feats, yaw, pitch) = entry;
-            // Scale ×1000 so angles (≈ ±0.5 rad) are in a range where lambda auto-tuning works well
-            reg.add_sample(feats.clone(), (*yaw * 1000.0) as f32, (*pitch * 1000.0) as f32);
+        for &i in &calib_indices {
+            if let Some((feats, yaw, pitch)) = &extracted[i] {
+                // Scale ×1000 so angles (≈ ±0.5 rad) are in a range where lambda auto-tuning works well
+                reg.add_sample(feats.clone(), (*yaw * 1000.0) as f32, (*pitch * 1000.0) as f32);
+            }
         }
 
         // Auto-tune lambda via LOO CV
@@ -139,10 +163,11 @@ fn main() {
             println!(" solve failed"); continue;
         };
 
-        // Test phase
+        // Test phase: all frames NOT in calibration set
         let mut subject_errors: Vec<f64> = Vec::new();
-        for entry in extracted.iter().skip(n_calib).flatten() {
-            let (feats, true_yaw, true_pitch) = entry;
+        for (i, entry) in extracted.iter().enumerate() {
+            if calib_set.contains(&i) { continue; }
+            let Some((feats, true_yaw, true_pitch)) = entry else { continue };
             let (py_scaled, pp_scaled) = RidgeRegressor::predict_from_coeffs(feats, &beta_x, &beta_y);
 
             let pred_yaw   = py_scaled as f64 / 1000.0;
@@ -246,8 +271,49 @@ fn parse_labels(label_path: &str, subject_dir: &str) -> Result<Vec<Sample>, Stri
 
 // ─── Feature extraction ──────────────────────────────────────────────────────
 
+/// Flip a grayscale image horizontally (mirror left↔right).
+fn flip_horizontal(img: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            out[y * w + x] = img[y * w + (w - 1 - x)];
+        }
+    }
+    out
+}
+
+/// Compute per-pixel Sobel-x gradient on a CLAHE'd image (already [0,255]).
+/// Returns values shifted to [0,255] (128 = zero gradient).
+fn sobel_x_features(clahe: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let mut out = vec![128.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let xm = if x > 0 { x - 1 } else { 0 };
+            let xp = if x + 1 < w { x + 1 } else { w - 1 };
+            let ym = if y > 0 { y - 1 } else { 0 };
+            let yp = if y + 1 < h { y + 1 } else { h - 1 };
+            // Sobel-x: [-1 0 1; -2 0 2; -1 0 1]
+            let gx = -1.0 * clahe[ym * w + xm]
+                   +  1.0 * clahe[ym * w + xp]
+                   + -2.0 * clahe[y  * w + xm]
+                   +  2.0 * clahe[y  * w + xp]
+                   + -1.0 * clahe[yp * w + xm]
+                   +  1.0 * clahe[yp * w + xp];
+            // Scale: max kernel response ≈ 8×255=2040; map to [0,255]
+            out[y * w + x] = (gx / 2040.0 * 127.5 + 128.0).clamp(0.0, 255.0);
+        }
+    }
+    out
+}
+
 /// Extract features from one sample. Returns (features, yaw_rad, pitch_rad) or None.
-fn extract_features(s: &Sample, patch_w: usize, patch_h: usize) -> Option<(Vec<f32>, f64, f64)> {
+fn extract_features(
+    s: &Sample,
+    patch_w: usize,
+    patch_h: usize,
+    flip_right: bool,
+    use_gradient: bool,
+) -> Option<(Vec<f32>, f64, f64)> {
     let load_gray = |path: &str| -> Option<(Vec<u8>, usize, usize)> {
         let img = ImageReader::open(path).ok()?.decode().ok()?.into_luma8();
         let (w, h) = (img.width() as usize, img.height() as usize);
@@ -255,11 +321,26 @@ fn extract_features(s: &Sample, patch_w: usize, patch_h: usize) -> Option<(Vec<f
     };
 
     let (left_gray,  lw, lh) = load_gray(&s.left_path)?;
-    let (right_gray, rw, rh) = load_gray(&s.right_path)?;
+    let (right_gray_raw, rw, rh) = load_gray(&s.right_path)?;
+    let right_gray = if flip_right {
+        flip_horizontal(&right_gray_raw, rw, rh)
+    } else {
+        right_gray_raw
+    };
 
     // Patches are single-channel (grayscale PNG from preprocessor)
     let l_feat = ridge::extract_eye_features_gray_sized(&left_gray,  lw, lh, patch_w, patch_h);
     let r_feat = ridge::extract_eye_features_gray_sized(&right_gray, rw, rh, patch_w, patch_h);
+
+    // Optionally append Sobel-x gradient features (same spatial layout as pixels)
+    let l_feat = if use_gradient {
+        let grad = sobel_x_features(&l_feat, patch_w, patch_h);
+        [l_feat, grad].concat()
+    } else { l_feat };
+    let r_feat = if use_gradient {
+        let grad = sobel_x_features(&r_feat, patch_w, patch_h);
+        [r_feat, grad].concat()
+    } else { r_feat };
 
     // Convert 3-D unit gaze vector → yaw/pitch angles.
     // MPIIGaze convention: x=right, y=down, z=toward camera.
