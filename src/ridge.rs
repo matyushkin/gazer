@@ -15,13 +15,14 @@
 use nalgebra::{DMatrix, DVector};
 
 /// Eye patch output resolution.
-/// E14 ablation (Original data): 20×12 → 10.35° vs 10×6 → 12.37° (-16%).
-/// E15 ablation (Normalized data): 20×12 → 5.89° ≈ 30×18 → 5.91° ≈ 40×24 → 5.86° (plateau).
-/// 20×12 optimal: best accuracy/feature ratio; larger patches offer negligible gain at n=200.
-pub const EYE_PATCH_W: usize = 20;
-pub const EYE_PATCH_H: usize = 12;
-pub const EYE_FEAT_LEN: usize = EYE_PATCH_W * EYE_PATCH_H; // 240 per eye
-pub const BOTH_EYES_FEAT_LEN: usize = EYE_FEAT_LEN * 2; // 480 total
+/// E15 ablation (first-N protocol): 20×12 ≈ 30×18 ≈ 40×24 — plateau at n=200 (bad calib).
+/// E17 ablation (uniform-calib protocol): 30×18 > 20×12 at all n (100/200/500/1000).
+///   n=200 uniform: 30×18 → 3.70° vs 20×12 → 3.85°. n=1000: 30×18 → 3.21° vs 20×12 → 3.40°.
+/// 30×18 optimal: best accuracy with structured grid calibration (7×7 = 98 samples).
+pub const EYE_PATCH_W: usize = 30;
+pub const EYE_PATCH_H: usize = 18;
+pub const EYE_FEAT_LEN: usize = EYE_PATCH_W * EYE_PATCH_H; // 540 per eye
+pub const BOTH_EYES_FEAT_LEN: usize = EYE_FEAT_LEN * 2; // 1080 total
 
 /// Extract WebGazer-style features from an RGB eye patch.
 /// Returns a 60-element feature vector (10×6 CLAHE-normalized grayscale).

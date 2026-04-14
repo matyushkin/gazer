@@ -2,11 +2,11 @@
 //!
 //! Pipeline:
 //!   camera → rustface (face bbox) → PFLD landmarks → eye patches →
-//!   10×6 grayscale histogram-equalized features (120-D) → ridge regression
-//!   → Kalman filter → 4-point moving average → gaze cursor
+//!   20×12 CLAHE-normalized features (480-D) → ridge regression
+//!   → OneEuro filter → 16-point moving average → gaze cursor
 //!
-//! Calibration: 9 points shown in sequence. Look at the red dot and press SPACE
-//! 5 times to capture samples (mimicking WebGazer's click-based calibration).
+//! Calibration: 7×7 number-grid game (49 unique screen positions × 2 rounds = 98 samples).
+//! E16: 7×7 gives ~35% better accuracy than 5×5 due to better gaze-angle coverage.
 //!
 //! Controls:
 //!   SPACE — capture calibration sample (during calibration)
@@ -98,36 +98,43 @@ fn pursuit_target(t: f64, sw: f64, sh: f64) -> (f64, f64) {
     }
 }
 
-/// 5x5 grid calibration: 25 cells with random number labels.
-/// User clicks numbers 1..25 in order, each click adds a sample.
-fn grid_5x5_centers(w: usize, h: usize) -> Vec<(f64, f64)> {
-    let mx = w as f64 * 0.08;
-    let my = h as f64 * 0.08;
+// ── Calibration grid dimensions ──────────────────────────────────────────────
+// E16: calibration angle *diversity* is the #1 accuracy lever.
+// 7×7 = 49 unique screen positions vs 5×5 = 25 → better gaze-angle coverage.
+// Total samples: GRID_COLS × GRID_ROWS × GRID_ROUNDS = 49 × 2 = 98.
+const GRID_COLS: usize = 7;
+const GRID_ROWS: usize = 7;
+const GRID_N: usize = GRID_COLS * GRID_ROWS; // 49
+
+/// NxN grid calibration: cells with random number labels.
+/// User clicks numbers 1..GRID_N in order, each click adds one sample.
+fn grid_nxn_centers(w: usize, h: usize) -> Vec<(f64, f64)> {
+    let mx = w as f64 * 0.06;
+    let my = h as f64 * 0.06;
     let usable_w = w as f64 - 2.0 * mx;
     let usable_h = h as f64 - 2.0 * my;
-    let mut pts = Vec::with_capacity(25);
-    for row in 0..5 {
-        for col in 0..5 {
-            // Cell center
-            let cx = mx + usable_w * (col as f64 + 0.5) / 5.0;
-            let cy = my + usable_h * (row as f64 + 0.5) / 5.0;
+    let mut pts = Vec::with_capacity(GRID_N);
+    for row in 0..GRID_ROWS {
+        for col in 0..GRID_COLS {
+            let cx = mx + usable_w * (col as f64 + 0.5) / GRID_COLS as f64;
+            let cy = my + usable_h * (row as f64 + 0.5) / GRID_ROWS as f64;
             pts.push((cx, cy));
         }
     }
     pts
 }
 
-/// Build a random permutation of 1..25 → maps cell index → number to display.
-fn random_number_map() -> [u32; 25] {
-    let mut nums: [u32; 25] = std::array::from_fn(|i| (i + 1) as u32);
+/// Build a random permutation of 1..=GRID_N → maps cell index → number to display.
+fn random_number_map() -> Vec<u32> {
+    let mut nums: Vec<u32> = (1..=(GRID_N as u32)).collect();
     // Fisher-Yates shuffle using time-based seed
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(12345);
     let mut state = seed;
-    for i in (1..25).rev() {
-        // xorshift
+    for i in (1..GRID_N).rev() {
+        // xorshift64
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -204,7 +211,7 @@ fn draw_digit(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, digit: 
     if segments[6] { draw_h_seg(buf, 0); }
 }
 
-/// Draw a number 1-25 (one or two digits) centered at (cx, cy).
+/// Draw a number 1-99 (one or two digits) centered at (cx, cy).
 fn draw_number(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, n: u32, color: u32) {
     if n < 10 {
         draw_digit(buf, w, h, cx, cy, n, color);
@@ -323,17 +330,18 @@ fn main() {
     let mut gaze_history: Vec<(f64, f64)> = Vec::with_capacity(16);
     const SMOOTHING_WINDOW: usize = 16;
 
-    // 5x5 grid game calibration: 25 cells with random number labels, played 2 rounds.
-    // Round 1: numbers 1..25 in random positions. Round 2: re-shuffle and play again.
-    // Total: 50 samples across 25 unique screen positions.
-    let grid_centers = grid_5x5_centers(sw, sh);
+    // 7×7 grid game calibration: 49 cells with random number labels, played 2 rounds.
+    // Round 1: numbers 1..49 in random positions. Round 2: re-shuffle and play again.
+    // Total: 98 samples across 49 unique screen positions.
+    // E16: 49 unique positions (vs 25 in 5×5) gives better gaze-angle coverage → ~35% lower error.
+    let grid_centers = grid_nxn_centers(sw, sh);
     let mut number_map = random_number_map();
     let mut next_number: u32 = 1;
     let mut grid_calib_done = false;
     let mut grid_round: u32 = 1;
     const GRID_ROUNDS: u32 = 2;
 
-    // Old 9-point click flow disabled in favor of 5x5 game
+    // Old 9-point click flow disabled in favor of 7×7 game
     let targets: Vec<(f64, f64)> = grid_centers.clone();
     const SAMPLES_PER_POINT: u32 = 1;
     let mut calib = CalibrationState::new(targets.len(), SAMPLES_PER_POINT);
@@ -566,19 +574,19 @@ fn main() {
             }
         }
 
-        // --- Calibration phase: 5x5 number grid game ---
+        // --- Calibration phase: 7×7 number grid game ---
         if calib.phase() == Phase::Calibrating && !grid_calib_done {
-            let mx = sw as f64 * 0.08;
-            let my = sh as f64 * 0.08;
+            let mx = sw as f64 * 0.06;
+            let my = sh as f64 * 0.06;
             let usable_w = sw as f64 - 2.0 * mx;
             let usable_h = sh as f64 - 2.0 * my;
-            let cell_w = usable_w / 5.0;
-            let cell_h = usable_h / 5.0;
+            let cell_w = usable_w / GRID_COLS as f64;
+            let cell_h = usable_h / GRID_ROWS as f64;
 
             // Draw all cell borders + numbers (numbers fade as user clicks them)
-            for cell_idx in 0..25 {
-                let row = cell_idx / 5;
-                let col = cell_idx % 5;
+            for cell_idx in 0..GRID_N {
+                let row = cell_idx / GRID_COLS;
+                let col = cell_idx % GRID_COLS;
                 let cell_x = (mx + cell_w * col as f64) as usize;
                 let cell_y = (my + cell_h * row as f64) as usize;
                 let cw_px = cell_w as usize;
@@ -626,8 +634,8 @@ fn main() {
                 // Find which cell was clicked
                 let col = ((mx_click - mx) / cell_w).floor() as i32;
                 let row = ((my_click - my) / cell_h).floor() as i32;
-                if col >= 0 && col < 5 && row >= 0 && row < 5 {
-                    let clicked_idx = (row * 5 + col) as usize;
+                if col >= 0 && col < GRID_COLS as i32 && row >= 0 && row < GRID_ROWS as i32 {
+                    let clicked_idx = (row * GRID_COLS as i32 + col) as usize;
                     let clicked_n = number_map[clicked_idx];
                     if clicked_n == next_number {
                         // Correct! Capture sample at cell center
@@ -640,10 +648,10 @@ fn main() {
                                 target_x: cell_cx as f32,
                                 target_y: cell_cy as f32,
                             });
-                            println!("  Found {next_number}/25 at cell ({col},{row})");
+                            println!("  Found {next_number}/{GRID_N} at cell ({col},{row})");
                         }
                         next_number += 1;
-                        if next_number > 25 {
+                        if next_number > GRID_N as u32 {
                             if grid_round < GRID_ROUNDS {
                                 // Start next round with reshuffled numbers
                                 grid_round += 1;

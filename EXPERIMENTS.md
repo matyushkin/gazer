@@ -550,27 +550,71 @@ reproducibility with E13/E15. Use `--uniform-calib` for best accuracy / upper bo
 
 ---
 
+### E17. Patch size × n_calib sweep with uniform-calib — status: DONE (40×24 n=1000 = 3.14°, best ever)
+
+**Date:** 2026-04-15
+
+**Motivation:** E16 showed uniform-calib removes the feature plateau seen in E15.
+With good calibration, larger patches should help — testing this hypothesis.
+
+**Results (uniform-calib, 15 subjects):**
+
+| Patch | Feat-D | n=100 | n=200 | n=500 | n=1000 |
+|-------|--------|-------|-------|-------|--------|
+| 20×12 | 483 | 4.19° / 3.33° | 3.85° / 2.97° (E16) | 3.53° / 2.73° (E16) | 3.40° / 2.62° |
+| **30×18** | **1083** | **4.07° / 3.19°** | **3.70° / 2.82°** | **3.36° / 2.51°** | **3.21° / 2.39°** |
+| 40×24 | 1923 | — | — | 3.30° / 2.44° | **3.14° / 2.31°** |
+
+Literature: L2CS-Net 3.92° (no calib) · FAZE 3.18° (9-pt) · GazeTR-Hybrid 3.43° (no calib)
+
+**Key findings:**
+
+1. **With uniform calibration, larger patches consistently win** — the E15 plateau was an artifact
+   of poor calibration (first-N protocol). With diverse samples, 30×18 > 20×12 at ALL n values.
+
+2. **40×24 at n=1000: 3.14° beats FAZE (3.18°).** This is the best result in the project.
+   40×24 > 30×18 > 20×12 consistently at n=500 and n=1000.
+
+3. **30×18 chosen as new default** for the live app: best balance of accuracy and solve speed.
+   At n≈100 (live 7×7 × 2 rounds = 98 samples): 4.07° vs 4.19° for 20×12 (+2.9%).
+   40×24 at n=100 not tested; solve is O(p³) with p=1923 → ~2s solve at calibration end.
+
+4. **Scaling law (uniform, 30×18):** 4.07° → 3.70° → 3.36° → 3.21° for n=100→200→500→1000.
+   Diminishing returns but still improving at n=1000. No plateau visible.
+
+**Actions taken:**
+- `EYE_PATCH_W = 30, EYE_PATCH_H = 18` in `src/ridge.rs` (was 20×12)
+- `BOTH_EYES_FEAT_LEN = 1080` (was 480); `TOTAL_FEAT_LEN` in `webgazer.rs` auto-updates
+- 7×7 calibration grid in `examples/webgazer.rs` (was 5×5; GRID_COLS/ROWS = 7; GRID_N = 49)
+- GRID_ROUNDS = 2 (unchanged) → 98 total calibration samples
+
+**Expected live improvement:** 237 px → ~215–220 px (estimated from n=100 uniform 30×18 vs 20×12).
+
+---
+
 ## Best-of-the-best summary (for moving on or paper writing)
 
 | Approach | Mean error | Protocol | Notes |
 |----------|-----------|---------|-------|
-| **`webgazer.rs` pixel ridge, 5×5 grid, λ=auto, WHITE BG** | **237 px / 3.7°** | Honest multi-point (E12) | Live session |
-| **mpii_bench, 20×12, n=200, uniform-calib** | **3.85°** | Uniform sampling (E16) | Comparable to live structured grid |
-| **mpii_bench, 20×12, n=500, uniform-calib** | **3.53°** | Uniform sampling (E16) | Best result — beats FAZE |
-| mpii_bench, 20×12, n=500, first-N | 5.31° | Standard MPIIGaze (E15) | Conservative baseline |
+| **`webgazer.rs` live, 5×5 grid, 20×12** | **237 px / 3.7°** | Honest multi-point (E12) | Previous best live |
+| mpii_bench, 20×12, n=500, first-N | 5.31° | Standard MPIIGaze (E15) | Conservative benchmark |
+| mpii_bench, 20×12, n=200, uniform-calib | 3.85° / 2.97° | Uniform (E16) | Beats L2CS-Net |
+| mpii_bench, 30×18, n=200, uniform-calib | 3.70° / 2.82° | Uniform (E17) | New default patch |
+| mpii_bench, 30×18, n=1000, uniform-calib | 3.21° / 2.39° | Uniform (E17) | With many sessions |
+| **mpii_bench, 40×24, n=1000, uniform-calib** | **3.14° / 2.31°** | **Uniform (E17)** | **Best ever — beats FAZE** |
 | WebGazer.js (reference) | ~175 px / 4° | Browser click-based | Has continuous learning |
 | L2CS-Net | 3.92° | No calibration | Cross-subject DNN |
 | FAZE | 3.18° | 9-point calib | Meta-learned fine-tune |
+| GazeTR-Hybrid | 3.43° | No calibration | Transformer cross-subject |
 | `webgazer_cnn.rs` (any CNN config) | 300–700 px | — | Don't use until Sugano fixed |
 
-**Current state:** The uniform calibration result (3.85°/3.53°) shows that our linear ridge
-with structured grid calibration is competitive with SOTA DNNs. The gap vs live performance
-(237 px) is likely due to: fewer calib samples in short sessions, lighting/posture differences.
+**Current state:** The 30×18 patch + 7×7 calibration grid is deployed in `webgazer.rs`.
+Expected live improvement: 237 px → ~215 px. New session needed to measure actual improvement.
 
-Going to <150 px live requires:
-1. Larger calibration grid (7×7 or more) for better angular coverage
-2. Accumulated calibration clicks across sessions (Option D, free)
-3. Production Sugano normalization matched to a trained CNN (weeks)
+Going to <150 px live requires (in priority order):
+1. **Accumulated calibration across sessions** — free, existing infrastructure, just use it longer
+2. **40×24 patch** — better but slower solve; only worth it if n_calib ≥ 500 (5+ sessions)
+3. Production Sugano normalization → CNN approach (2-3 weeks)
 
 The white background, CLAHE, decay weights, blink filtering, and residual
 rejection are all in place — their combined effect needs a live session recording

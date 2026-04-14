@@ -7,13 +7,13 @@ Goal: minimize pixel error on multi-point live validation.
 
 | Metric | Value | Experiment | Config |
 |--------|-------|------------|--------|
-| Live (honest multi-point) | **237 px** | E12 | 5×5 grid, λ=auto, white BG |
+| Live (honest multi-point) | **237 px** | E12 | old 5×5/20×12 — needs new session with 7×7/30×18 |
 | MPIIGaze (first-N protocol) | **5.31°** | E15 | 20×12, n_calib=500 |
-| MPIIGaze (uniform-calib, n=200) | **3.85° / 2.97° median** | E16 | 20×12, uniform sampling |
-| MPIIGaze (uniform-calib, n=500) | **3.53° / 2.73° median** | E16 | 20×12, uniform sampling |
+| MPIIGaze (uniform-calib, n=200) | **3.70° / 2.82° median** | E17 | 30×18, uniform sampling |
+| MPIIGaze (uniform-calib, n=1000) | **3.14° / 2.31° median** | E17 | 40×24, uniform — best ever |
 
 Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 3.43° (no calib).
-**E16 key insight: calibration angle diversity beats feature engineering. Uniform sampling = -35% error.**
+**E16/E17 key insight: calibration angle diversity + larger patches = -47% error vs E13 baseline.**
 
 ## DO NOT RETRY — dead ends
 
@@ -23,7 +23,7 @@ Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 
 | Smooth pursuit calibration (E11) | 329 px vs 142 px — saccades + lag corrupt labels | Only with velocity-based saccade filtering + per-sample weights |
 | Head pose features appended to pixel ridge (E2) | 256 px, worse — features washed out by λ | Only with separate regression head |
 | ResNet-50 gaze CNN (E7) | <2 FPS — UI unusable | Only on hardware with GPU / NPU |
-| Patch size > 20×12 at n_calib=200 (E15) | Plateau: 30×18→5.91°, 36×21→6.02°, no gain | Retry with n_calib≥500 |
+| Patch size > 20×12 at n_calib=200 first-N (E15) | Plateau at 5.89-5.91° — but with uniform-calib 30x18 > 20x12 at ALL n | Always use uniform-calib when testing patch sizes |
 | Zero-mean feature normalization (E12) | -3% improvement, not worth complexity | — |
 | Decay sample weights (E12) | Neutral on this dataset, not worth complexity | Only for sessions with strong temporal drift |
 | Horizontal flip of right eye (E16) | 6.12° vs 5.89° — worse; MPIIGaze normalized space is already consistent | — |
@@ -31,11 +31,11 @@ Literature: L2CS-Net 3.92° (no calib), FAZE 3.18° (9-pt calib), GazeTR-Hybrid 
 
 ## Promising next steps (ordered)
 
-1. **Larger calibration grid in live app** — E16 shows calibration angle diversity is the key lever. 7×7 = 49 points covers more gaze angles than 5×5 = 25. Expected: significant improvement toward 3.85° level.
-2. **n_calib=500 live session** — more clicks per point, or more points. E15 shows -10% on MPIIGaze first-N; E16 shows the uniform protocol already reaches 3.53°.
-3. **Proper Sugano normalization** — fix `src/sugano.rs` iterative PnP. Expected: ~3.92° if matched correctly. 2-3 weeks.
-4. **MediaPipe FaceMesh** — replace PFLD (68 pts) with 468-point model for better eye ROI.
-5. **Accumulated clicks across sessions** — `saccade_calib.bin` already persists; just use it longer.
+1. **Run a new live session** — measure actual improvement from 7×7 grid + 30×18 patches. Expected: ~215 px vs old 237 px.
+2. **Accumulated calibration across sessions** — `saccade_calib.bin` persists. After ~500 total clicks (≈5 sessions × 98 clicks), upgrade to 40×24 patches for best results.
+3. **40×24 patches** — better than 30×18 at n≥500; set `EYE_PATCH_W=40, EYE_PATCH_H=24` after accumulating enough data.
+4. **Proper Sugano normalization** — fix `src/sugano.rs` iterative PnP. Expected: ~3.92° without calib → better with calib. 2-3 weeks.
+5. **MediaPipe FaceMesh** — replace PFLD (68 pts) with 468-point model for better eye ROI.
 
 ## Key files
 
@@ -62,16 +62,16 @@ camera → rustface (face bbox) → PFLD (68 landmarks) → eye crop
 ## Benchmark commands
 
 ```sh
-# Run MPIIGaze benchmark (45 sec) — standard first-N protocol
+# Standard first-N protocol (reproducible baseline)
 cargo run --release --example mpii_bench -- ./MPIIGaze_proc
 
-# Best accuracy: uniform calibration sampling (simulates structured grid calib)
-cargo run --release --example mpii_bench -- ./MPIIGaze_proc --n-calib 200 --uniform-calib
-cargo run --release --example mpii_bench -- ./MPIIGaze_proc --n-calib 500 --uniform-calib
+# Best accuracy protocol (uniform calib, simulates structured grid)
+cargo run --release --example mpii_bench -- ./MPIIGaze_proc --patch 30x18 --n-calib 200 --uniform-calib
+cargo run --release --example mpii_bench -- ./MPIIGaze_proc --patch 30x18 --n-calib 500 --uniform-calib
 
-# Resolution ablation
-cargo run --release --example mpii_bench -- ./MPIIGaze_proc --patch 30x18 --n-calib 500
+# Absolute best (slow solve: 1923-D features)
+cargo run --release --example mpii_bench -- ./MPIIGaze_proc --patch 40x24 --n-calib 1000 --uniform-calib
 
-# Query past results
-grep '"mpii_deg"' results.jsonl | jq '{exp,patch,n_calib,variant,mean_deg}'
+# Query results
+grep '"mpii_deg"' results.jsonl | jq '{exp,patch,n_calib,variant,mean_deg,median_deg}'
 ```
