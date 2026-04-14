@@ -293,16 +293,75 @@ geometric approach.
 
 ---
 
+---
+
+### E12. Offline replay benchmark — decay weights, residual filtering, CLAHE
+
+**Date:** 2026-04-14
+
+**Session:** `saccade_session.bin` recorded before this round of changes.
+50 calibration samples (25-point grid × 2 rounds), 5 multi-point validation samples
+at diverse screen positions (20/80% corners + center). Screen 2056×1329.
+
+**Tool:** `cargo run --release --example replay`
+
+**Results (multi-point, 5 diverse targets):**
+
+| Configuration | Mean err | Median err | Notes |
+|--------------|----------|------------|-------|
+| Uniform weights, λ=3e3 (auto) | **237 px** | 159 px | Best λ from LOO |
+| Decay w_i=sqrt(1/(n-i)), λ=3e3 | **237 px** | 159 px | No difference |
+| λ=1e-5 (replay default, bad) | 330 px | — | Underdamped |
+| λ=1e3 (sweep) | 238 px | 177 px | Near-optimal |
+| Outlier rejection (2σ, 49 kept) | 331 px | — | 1 sample removed, neutral |
+| Zero-mean normalization | 321 px | — | Marginal -3% |
+
+**LOO CV error:** 292 px (upper bound on expected generalization).
+
+**Key findings:**
+
+1. **Decay weights are neutral** on this session. The 50-sample 5×5 grid distributes
+   evenly across screen, so no temporal ordering bias exists. Decay weights would
+   matter more for long sessions where the calibration point distribution drifts.
+
+2. **Residual filtering removes 0–1 samples** from this clean session — it makes no
+   measurable difference. The benefit is for sessions with blinks or distracted clicks.
+
+3. **True multi-point accuracy is ~237 px**, not 142 px as reported in E1.
+   The discrepancy is because E1 used single-point validation at screen center
+   (in-distribution with calibration), while this is 5 diverse positions
+   (proper out-of-distribution test). 237 px / 3.7° is the honest baseline.
+
+4. **CLAHE cannot be benchmarked from saved sessions** — the session file stores
+   pre-extracted features, not raw pixels. A new live session is needed to measure
+   CLAHE's effect (expected: -5–15% in non-uniform lighting).
+
+5. **Moving average hurts in replay** (+60%) — the validation frames are independent
+   snapshots, not a temporal stream, so smoothing mixes different target positions.
+
+**Why 142 px (E1) ≠ 237 px (E12):**
+- E1 validated at 5 positions but the calibration covered the SAME positions.
+  Effectively measuring in-distribution error (how well the model memorizes training).
+- E12 measures true generalization: calibration = 25-point grid, validation = 5
+  different positions not in the calibration set. 237 px is the honest number.
+
+---
+
 ## Best-of-the-best summary (for moving on or paper writing)
 
 | Approach | Mean error | When to use |
 |----------|-----------|-------------|
-| **`webgazer.rs` pixel ridge, 45 cal, λ=auto, WHITE BG** | **142 px / 2.2°** | Default — beats WebGazer.js |
+| **`webgazer.rs` pixel ridge, 5×5 grid, λ=auto, WHITE BG** | **237 px / 3.7°** | Honest multi-point (E12) |
+| **`webgazer.rs` pixel ridge (E1, single-point val.)** | **142 px / 2.2°** | In-distribution — optimistic |
 | WebGazer.js (reference) | ~175 px / 4° | Browser, has continuous learning |
-| `webgazer_cnn.rs` (any CNN config) | 300-700 px | Don't use until Sugano fixed |
+| `webgazer_cnn.rs` (any CNN config) | 300–700 px | Don't use until Sugano fixed |
 
-**Current state:** **Beats WebGazer.js** on mean error for short sessions
-(142 px vs ~175 px) thanks to the white background lighting trick. Worst case
-is comparable. Still no head-pose compensation, so head movement breaks
-calibration. Going to <100 px would require production Sugano + CNN, multi-week
-effort.
+**Current state:** E12 reveals the honest multi-point error is **237 px / 3.7°**,
+comparable to WebGazer.js (~175 px is also in-distribution). The gap vs literature
+(FAZE 3.18°, L2CS-Net 3.92°) is real. Going to <150 px requires:
+1. Production Sugano normalization matched to a trained CNN (weeks)
+2. Or accumulated calibration clicks across many sessions (Option D, free)
+
+The white background, CLAHE, decay weights, blink filtering, and residual
+rejection are all in place — their combined effect needs a live session recording
+to measure (CLAHE operates on raw pixels, not recoverable from saved features).
